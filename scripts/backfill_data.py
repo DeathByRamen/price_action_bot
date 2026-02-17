@@ -23,7 +23,7 @@ def main() -> None:
         "--candles",
         type=int,
         default=2000,
-        help="Number of hourly candles to backfill per symbol (default: 2000 ≈ 83 days)",
+        help="Number of candles to backfill per symbol (default: 2000 ≈ 83 days of 1h)",
     )
     parser.add_argument(
         "--concurrency",
@@ -43,6 +43,17 @@ def main() -> None:
         default=None,
         help="Path to SQLite database file",
     )
+    parser.add_argument(
+        "--interval",
+        type=str,
+        default="60",
+        help="Candle interval: 1,3,5,15,30,60,120,240,360,720,D,W,M (default: 60)",
+    )
+    parser.add_argument(
+        "--all-timeframes",
+        action="store_true",
+        help="Backfill both 1h and 15m candles (auto-scales candle count for 15m)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -52,14 +63,41 @@ def main() -> None:
 
     symbols = args.symbols.split(",") if args.symbols else None
 
-    asyncio.run(
-        run_backfill(
-            db_path=args.db,
-            symbols=symbols,
-            total_candles=args.candles,
-            concurrency=args.concurrency,
+    if args.all_timeframes:
+        logging.info("Backfilling all timeframes: 60m + 15m")
+        # 1h backfill
+        logging.info("--- Backfilling 1h candles (%d per symbol) ---", args.candles)
+        asyncio.run(
+            run_backfill(
+                db_path=args.db,
+                symbols=symbols,
+                total_candles=args.candles,
+                concurrency=args.concurrency,
+                interval="60",
+            )
         )
-    )
+        # 15m backfill (4x the candles to cover the same time window)
+        candles_15m = args.candles * 4
+        logging.info("--- Backfilling 15m candles (%d per symbol) ---", candles_15m)
+        asyncio.run(
+            run_backfill(
+                db_path=args.db,
+                symbols=symbols,
+                total_candles=candles_15m,
+                concurrency=args.concurrency,
+                interval="15",
+            )
+        )
+    else:
+        asyncio.run(
+            run_backfill(
+                db_path=args.db,
+                symbols=symbols,
+                total_candles=args.candles,
+                concurrency=args.concurrency,
+                interval=args.interval,
+            )
+        )
 
 
 if __name__ == "__main__":

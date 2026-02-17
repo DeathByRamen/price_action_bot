@@ -32,6 +32,7 @@ async def load_training_data(
     db_path: str | None,
     min_candles: int = 200,
     rolling_days: int | None = None,
+    interval: str = "60",
 ) -> Dict[str, pd.DataFrame]:
     """
     Load per-symbol DataFrames with computed indicators.
@@ -48,10 +49,15 @@ async def load_training_data(
         Minimum candles required per symbol after indicator computation.
     rolling_days : int | None
         If set, only use the most recent N days of data per symbol.
+    interval : str
+        Candle interval to load (e.g. "60", "15").
     """
+    # For sub-hourly intervals, scale max candles proportionally
+    interval_mins = int(interval) if interval.isdigit() else 60
+    candles_per_day = (24 * 60) // interval_mins
     max_candles_per_sym = 10_000
     if rolling_days is not None:
-        max_candles_per_sym = rolling_days * 24 + 100
+        max_candles_per_sym = rolling_days * candles_per_day + 100
 
     symbol_data: Dict[str, pd.DataFrame] = {}
 
@@ -60,9 +66,9 @@ async def load_training_data(
         logging.info("Found %d symbols in database", len(symbols))
 
         for sym in symbols:
-            df = await storage.get_candles(sym, limit=max_candles_per_sym)
+            df = await storage.get_candles(sym, limit=max_candles_per_sym, interval=interval)
             if len(df) < min_candles:
-                logging.debug("Skipping %s: only %d candles", sym, len(df))
+                logging.debug("Skipping %s: only %d candles (%sm)", sym, len(df), interval)
                 continue
 
             # Rolling window filter
@@ -79,15 +85,17 @@ async def load_training_data(
 
             if len(df) >= min_candles:
                 symbol_data[sym] = df
-                logging.info("%s: %d rows after indicators", sym, len(df))
+                logging.info("%s: %d rows after indicators (%sm)", sym, len(df), interval)
 
     if not symbol_data:
-        raise RuntimeError("No symbols have enough data for training")
+        raise RuntimeError(
+            f"No symbols have enough {interval}m data for training"
+        )
 
     total_rows = sum(len(df) for df in symbol_data.values())
     logging.info(
-        "Loaded training data: %d total rows from %d symbols",
-        total_rows, len(symbol_data),
+        "Loaded training data: %d total rows from %d symbols (%sm interval)",
+        total_rows, len(symbol_data), interval,
     )
     return symbol_data
 
@@ -133,12 +141,22 @@ def main() -> None:
         default=False,
         help="Back up the existing model_final.pt before overwriting",
     )
+    parser.add_argument(
+        "--interval",
+        type=str,
+        default="60",
+        help="Candle interval to train on: 15, 30, 60, etc. (default: 60). "
+             "Checkpoint is saved as model_final_{interval}.pt",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+    interval = args.interval
+    logging.info("Training for %sm interval", interval)
 
     if args.rolling_days:
         logging.info("Rolling window: using last %d days of data per symbol", args.rolling_days)
@@ -148,7 +166,7 @@ def main() -> None:
 
     # Load per-symbol data (no global concatenation)
     symbol_data = asyncio.run(
-        load_training_data(args.db, rolling_days=args.rolling_days)
+        load_training_data(args.db, rolling_days=args.rolling_days, interval=interval)
     )
 
     feature_cols = get_feature_columns()
@@ -205,7 +223,7 @@ def main() -> None:
     logging.info("Calibrating probability temperature on validation set...")
     trainer.calibrate_temperature(val_ds)
 
-    final_path = trainer.save_final()
+    final_path = trainer.save_final(tag=f"final_{interval}")
 
     logging.info("Training complete. Best model saved to: %s", final_path)
     logging.info(

@@ -1,19 +1,19 @@
 """
-Main hourly pipeline orchestrator.
+Main pipeline orchestrator — supports single and multi-timeframe modes.
 
-Each run:
-  1. Discover all futures symbols via tickers endpoint
-  2. Fetch latest candles for each symbol (incremental gap-fill)
-  3. For each symbol with enough data, compute indicators + run inference
-  4. Rank predictions by signal strength
-  5. Dispatch top signals to notification channels
-  6. Log all predictions to the database
+Single-timeframe (default):
+  Runs predictions at one interval (e.g. 1h).
+
+Multi-timeframe:
+  Runs predictions at two intervals (e.g. 1h + 15m), combines them
+  via the ensemble module, and dispatches the combined signals.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional
+import os
+from typing import Dict, List, Optional, Union
 
 import yaml
 
@@ -21,6 +21,11 @@ from src.api.bitunix_client import BitunixClient
 from src.data.collector import DataCollector
 from src.data.storage import Storage
 from src.model.predictor import Prediction, Predictor
+from src.model.ensemble import (
+    MultiTimeframePrediction,
+    combine_timeframes,
+    format_multi_timeframe_message,
+)
 from src.notifications.dispatcher import Dispatcher, Notifier
 from src.notifications.discord_notifier import DiscordNotifier
 from src.notifications.telegram_notifier import TelegramNotifier
@@ -71,9 +76,10 @@ async def run_pipeline(
     config: Dict,
     db_path: Optional[str] = None,
     model_path: Optional[str] = None,
+    interval: Optional[str] = None,
 ) -> List[Prediction]:
     """
-    Execute the full hourly prediction pipeline.
+    Execute the prediction pipeline for a single timeframe.
 
     Parameters
     ----------
@@ -83,6 +89,8 @@ async def run_pipeline(
         Override for SQLite database path.
     model_path : str | None
         Override for model checkpoint path.
+    interval : str | None
+        Candle interval override (e.g. "15", "60").  Defaults to config value.
 
     Returns
     -------
@@ -90,11 +98,12 @@ async def run_pipeline(
     """
     model_cfg = config.get("model", {})
     pipeline_cfg = config.get("pipeline", {})
+    interval = interval or pipeline_cfg.get("interval", "60")
     window_size = model_cfg.get("window_size", 168)
     hidden_dim = model_cfg.get("hidden_dim", 128)
     top_n = pipeline_cfg.get("top_n_signals", 10)
     lookback_candles = pipeline_cfg.get("lookback_candles", 10)
-    candle_limit = window_size + 100  # enough for indicators + window
+    candle_limit = window_size + 100
 
     # 1. Set up components
     dispatcher = build_dispatcher(config)
@@ -111,23 +120,24 @@ async def run_pipeline(
 
         # 2. Discover symbols
         symbols = await collector.discover_futures_symbols()
-        logger.info("Pipeline: processing %d symbols", len(symbols))
+        logger.info("Pipeline [%sm]: processing %d symbols", interval, len(symbols))
 
         # 3. Fetch latest candles (gap-fill)
         new_candles = await collector.fetch_latest_candles(
-            symbols, interval="60", lookback=lookback_candles
+            symbols, interval=interval, lookback=lookback_candles
         )
-        logger.info("Fetched %d new candles across all symbols", new_candles)
+        logger.info("Fetched %d new %sm candles", new_candles, interval)
 
         # 4. For each symbol: load candles -> indicators -> predict
         symbol_latest_ts: dict[str, str] = {}
         for symbol in symbols:
             try:
-                df = await storage.get_candles(symbol, limit=candle_limit)
+                df = await storage.get_candles(
+                    symbol, limit=candle_limit, interval=interval
+                )
                 if df.empty or len(df) < window_size + 50:
                     continue
 
-                # Track the latest candle timestamp for this symbol
                 symbol_latest_ts[symbol] = str(df["ts"].iloc[-1])
 
                 pred = predictor.predict_symbol(df, symbol)
@@ -136,15 +146,16 @@ async def run_pipeline(
             except Exception as exc:
                 logger.warning("Prediction failed for %s: %s", symbol, exc)
 
-        logger.info("Generated %d predictions", len(all_predictions))
+        logger.info("Generated %d predictions [%sm]", len(all_predictions), interval)
 
         # 5. Rank by signal strength
         ranked = predictor.rank_predictions(all_predictions)
 
-        # 6. Dispatch notifications
-        await dispatcher.dispatch(ranked, top_n=top_n)
+        # 6. Dispatch notifications (only in single-timeframe mode)
+        if not model_path or "multi" not in str(model_path):
+            await dispatcher.dispatch(ranked, top_n=top_n)
 
-        # 7. Log predictions to database with actual candle timestamps
+        # 7. Log predictions to database
         if ranked:
             pred_rows = [
                 (
@@ -159,7 +170,87 @@ async def run_pipeline(
                 )
                 for p in ranked
             ]
-            await storage.insert_predictions(pred_rows)
-            logger.info("Logged %d predictions to database", len(pred_rows))
+            await storage.insert_predictions(pred_rows, interval=interval)
+            logger.info("Logged %d predictions to database [%sm]", len(pred_rows), interval)
 
     return ranked
+
+
+async def run_multi_timeframe_pipeline(
+    config: Dict,
+    db_path: Optional[str] = None,
+) -> List[MultiTimeframePrediction]:
+    """
+    Execute the multi-timeframe prediction pipeline.
+
+    Runs predictions at two intervals (primary + secondary), combines
+    them via the ensemble module, and dispatches the combined signals.
+
+    Returns
+    -------
+    List of MultiTimeframePrediction, sorted by combined score.
+    """
+    tf_cfg = config.get("timeframes", {})
+    primary_cfg = tf_cfg.get("primary", {})
+    secondary_cfg = tf_cfg.get("secondary", {})
+    top_n = config.get("pipeline", {}).get("top_n_signals", 10)
+
+    primary_interval = primary_cfg.get("interval", "60")
+    secondary_interval = secondary_cfg.get("interval", "15")
+    primary_weight = primary_cfg.get("weight", 0.6)
+    secondary_weight = secondary_cfg.get("weight", 0.4)
+    primary_window = primary_cfg.get("window_size", 168)
+    secondary_window = secondary_cfg.get("window_size", 672)
+    primary_checkpoint = primary_cfg.get("checkpoint", "data/models/model_final_60.pt")
+    secondary_checkpoint = secondary_cfg.get("checkpoint", "data/models/model_final_15.pt")
+
+    # Build config overrides for each timeframe
+    primary_config = {**config, "model": {**config.get("model", {}), "window_size": primary_window}}
+    secondary_config = {**config, "model": {**config.get("model", {}), "window_size": secondary_window}}
+
+    logger.info(
+        "Multi-timeframe: %sm (weight=%.1f) + %sm (weight=%.1f)",
+        primary_interval, primary_weight, secondary_interval, secondary_weight,
+    )
+
+    # Run primary timeframe
+    logger.info("Running primary timeframe (%sm)...", primary_interval)
+    primary_preds = await run_pipeline(
+        primary_config,
+        db_path=db_path,
+        model_path=primary_checkpoint,
+        interval=primary_interval,
+    )
+
+    # Run secondary timeframe
+    logger.info("Running secondary timeframe (%sm)...", secondary_interval)
+    secondary_preds = await run_pipeline(
+        secondary_config,
+        db_path=db_path,
+        model_path=secondary_checkpoint,
+        interval=secondary_interval,
+    )
+
+    # Combine via ensemble
+    combined = combine_timeframes(
+        primary_preds, secondary_preds,
+        primary_weight=primary_weight,
+        secondary_weight=secondary_weight,
+    )
+
+    # Dispatch combined notifications
+    dispatcher = build_dispatcher(config)
+    if combined and dispatcher._channels:
+        message = format_multi_timeframe_message(
+            combined,
+            top_n=top_n,
+            primary_label=f"{primary_interval}m",
+            secondary_label=f"{secondary_interval}m",
+        )
+        for channel in dispatcher._channels:
+            try:
+                await channel.send(message)
+            except Exception as exc:
+                logger.error("Failed to send multi-TF alert via %s: %s", channel.name, exc)
+
+    return combined

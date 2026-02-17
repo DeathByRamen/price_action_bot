@@ -63,7 +63,7 @@ class DataCollector:
                     )
                     if candles:
                         rows = self._candles_to_rows(candles)
-                        inserted = await self.storage.insert_candles(rows)
+                        inserted = await self.storage.insert_candles(rows, interval=interval)
                         if inserted:
                             logger.debug("%s: +%d candles", symbol, inserted)
                         return inserted
@@ -127,7 +127,7 @@ class DataCollector:
                 break
 
             rows = self._candles_to_rows(candles)
-            inserted = await self.storage.insert_candles(rows)
+            inserted = await self.storage.insert_candles(rows, interval=interval)
             inserted_total += inserted
 
             earliest_ts = candles[0].ts

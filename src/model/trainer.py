@@ -274,9 +274,21 @@ class Trainer:
             "reg_mae": float(np.mean(abs_errors)) if abs_errors else 0.0,
         }
 
-    def save_final(self, path: Optional[str] = None) -> str:
-        """Save the current model weights (including calibrated temperature)."""
-        path = path or os.path.join(self.checkpoint_dir, "model_final.pt")
+    def save_final(self, path: Optional[str] = None, tag: Optional[str] = None) -> str:
+        """
+        Save the current model weights (including calibrated temperature).
+
+        Parameters
+        ----------
+        path : str | None
+            Explicit file path. Overrides tag.
+        tag : str | None
+            If set, saves as ``model_{tag}.pt`` (e.g. ``model_final_60.pt``
+            for the 1h model). Ignored when *path* is provided.
+        """
+        if path is None:
+            filename = f"model_{tag}.pt" if tag else "model_final.pt"
+            path = os.path.join(self.checkpoint_dir, filename)
         torch.save(self.model.state_dict(), path)
         logger.info("Model saved to %s", path)
         return path

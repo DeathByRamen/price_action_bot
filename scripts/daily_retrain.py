@@ -56,16 +56,23 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f) or {}
 
 
-async def gap_fill(db_path: str | None) -> int:
-    """Fetch the last 48 hours of candles for all symbols to fill any gaps."""
+async def gap_fill(db_path: str | None, intervals: list[str] | None = None) -> int:
+    """Fetch recent candles for all symbols and intervals to fill gaps."""
+    intervals = intervals or ["60"]
+    total = 0
     async with BitunixClient() as client, Storage(db_path) as storage:
         collector = DataCollector(client, storage)
         symbols = await collector.discover_futures_symbols()
-        new_candles = await collector.fetch_latest_candles(
-            symbols, interval="60", lookback=48, concurrency=8
-        )
-        logging.info("Gap-fill complete: %d new candles", new_candles)
-        return new_candles
+        for interval in intervals:
+            # Scale lookback by interval: 48h worth of candles
+            interval_mins = int(interval) if interval.isdigit() else 60
+            lookback = max(10, (48 * 60) // interval_mins)
+            new_candles = await collector.fetch_latest_candles(
+                symbols, interval=interval, lookback=lookback, concurrency=8
+            )
+            logging.info("Gap-fill [%sm]: %d new candles", interval, new_candles)
+            total += new_candles
+    return total
 
 
 async def run_scoring_and_tuning(
@@ -172,6 +179,98 @@ def format_accuracy_digest(
     return "\n".join(lines)
 
 
+def _train_single_timeframe(
+    db_path: str | None,
+    interval: str,
+    window_size: int,
+    hidden_dim: int,
+    rolling_days: int,
+    epochs: int,
+    patience: int,
+    folds: int,
+    new_threshold: float,
+    symbol_weights: dict[str, float],
+    feature_cols: list[str],
+) -> tuple[str, dict]:
+    """Train a single timeframe model and return (save_path, history)."""
+    logging.info("--- Training %sm model (window=%d) ---", interval, window_size)
+
+    symbol_data = asyncio.run(
+        load_training_data(db_path, rolling_days=rolling_days, interval=interval)
+    )
+
+    use_weights = bool(symbol_weights)
+    splits = walk_forward_split(
+        symbol_data,
+        n_splits=folds,
+        window_size=window_size,
+        horizon=1,
+        feature_cols=feature_cols,
+        flat_threshold=new_threshold,
+        symbol_weights=symbol_weights if use_weights else None,
+    )
+
+    if not splits:
+        logging.error("No valid splits for %sm model. Skipping.", interval)
+        return "", {}
+
+    train_ds, val_ds = splits[-1]
+    logging.info(
+        "[%sm] Final fold: %d train / %d val samples",
+        interval, len(train_ds), len(val_ds),
+    )
+
+    label_counts = train_ds.get_label_counts()
+    logging.info(
+        "[%sm] Labels: UP=%d, FLAT=%d, DOWN=%d",
+        interval, label_counts[0], label_counts[1], label_counts[2],
+    )
+    class_weights = None
+    if label_counts.min() > 0:
+        inv_freq = 1.0 / label_counts.astype(np.float64)
+        normed = (inv_freq / inv_freq.sum()) * 3
+        class_weights = torch.tensor(normed, dtype=torch.float32)
+
+    trainer = Trainer(
+        num_features=len(feature_cols),
+        hidden_dim=hidden_dim,
+        num_layers=2,
+        dropout=0.3,
+        lr=1e-3,
+        batch_size=64,
+        max_epochs=epochs,
+        patience=patience,
+        class_weights=class_weights,
+    )
+
+    history = trainer.fit(
+        train_ds, val_ds, tag=f"retrain_{interval}", use_sample_weights=use_weights
+    )
+
+    # Calibrate temperature
+    logging.info("[%sm] Calibrating probability temperature...", interval)
+    trainer.calibrate_temperature(val_ds)
+
+    final_path = trainer.save_final(tag=f"final_{interval}")
+
+    # Permutation importance
+    importance_text = None
+    try:
+        importances = compute_permutation_importance(
+            model=trainer.model,
+            dataset=val_ds,
+            feature_names=feature_cols,
+            device=trainer.device,
+            n_repeats=3,
+        )
+        importance_text = format_importance_report(importances)
+        logging.info("[%sm] Feature importance:\n%s", interval, importance_text)
+    except Exception as exc:
+        logging.warning("[%sm] Permutation importance failed: %s", interval, exc)
+
+    return final_path, history
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Daily model retrain (cron-friendly)")
     parser.add_argument(
@@ -197,21 +296,43 @@ def main() -> None:
     retrain_cfg = config.get("retrain", {})
     model_cfg = config.get("model", {})
     scoring_cfg = config.get("scoring", {})
+    tf_cfg = config.get("timeframes", {})
 
     rolling_days = retrain_cfg.get("rolling_days", 60)
     epochs = retrain_cfg.get("epochs", 50)
     patience = retrain_cfg.get("patience", 8)
     folds = retrain_cfg.get("folds", 3)
-    window_size = model_cfg.get("window_size", 168)
     hidden_dim = model_cfg.get("hidden_dim", 128)
     old_threshold = scoring_cfg.get("current_flat_threshold", DEFAULT_FLAT_THRESHOLD)
 
-    # Step 1: Gap-fill recent candles
-    logging.info("Step 1/8: Gap-filling recent candle data...")
-    asyncio.run(gap_fill(args.db))
+    # Determine which timeframes to train
+    multi_tf_enabled = tf_cfg.get("enabled", False)
+    timeframes_to_train = []
+    if multi_tf_enabled:
+        primary = tf_cfg.get("primary", {})
+        secondary = tf_cfg.get("secondary", {})
+        timeframes_to_train = [
+            (primary.get("interval", "60"), primary.get("window_size", 168)),
+            (secondary.get("interval", "15"), secondary.get("window_size", 672)),
+        ]
+    else:
+        timeframes_to_train = [
+            (config.get("pipeline", {}).get("interval", "60"), model_cfg.get("window_size", 168)),
+        ]
+
+    all_intervals = [tf[0] for tf in timeframes_to_train]
+    n_timeframes = len(timeframes_to_train)
+    total_steps = 4 + n_timeframes + 1  # gap-fill, score, threshold, backup, N trains, digest
+
+    # Step 1: Gap-fill recent candles for all timeframes
+    step = 1
+    logging.info("Step %d/%d: Gap-filling candles for intervals: %s",
+                  step, total_steps, ", ".join(f"{i}m" for i in all_intervals))
+    asyncio.run(gap_fill(args.db, intervals=all_intervals))
 
     # Step 2: Score predictions and tune
-    logging.info("Step 2/8: Scoring predictions and computing accuracy...")
+    step += 1
+    logging.info("Step %d/%d: Scoring predictions and computing accuracy...", step, total_steps)
     report, new_threshold, symbol_weights = asyncio.run(
         run_scoring_and_tuning(args.db, scoring_cfg)
     )
@@ -224,112 +345,60 @@ def main() -> None:
             report.total_scored,
         )
 
-    logging.info("Step 3/8: Threshold %.4f -> %.4f", old_threshold, new_threshold)
+    # Step 3: Report threshold change
+    step += 1
+    logging.info("Step %d/%d: Threshold %.4f -> %.4f", step, total_steps, old_threshold, new_threshold)
 
-    # Step 4: Back up existing checkpoint
-    logging.info("Step 4/8: Backing up existing model checkpoint...")
+    # Step 4: Back up existing checkpoints
+    step += 1
+    logging.info("Step %d/%d: Backing up existing model checkpoints...", step, total_steps)
     backup_checkpoint()
-
-    # Step 5: Load data and train
-    logging.info(
-        "Step 5/8: Retraining on %d-day rolling window (epochs=%d, patience=%d, threshold=%.4f)...",
-        rolling_days, epochs, patience, new_threshold,
-    )
-
-    symbol_data = asyncio.run(
-        load_training_data(args.db, rolling_days=rolling_days)
-    )
 
     feature_cols = get_feature_columns()
 
-    # Walk-forward splits with adaptive threshold and weights
-    use_weights = bool(symbol_weights)
-    splits = walk_forward_split(
-        symbol_data,
-        n_splits=folds,
-        window_size=window_size,
-        horizon=1,
-        feature_cols=feature_cols,
-        flat_threshold=new_threshold,
-        symbol_weights=symbol_weights if use_weights else None,
-    )
-
-    if not splits:
-        logging.error("No valid train/val splits. Not enough data for retrain.")
-        sys.exit(1)
-
-    train_ds, val_ds = splits[-1]
-    logging.info(
-        "Training on final fold: %d train / %d val samples",
-        len(train_ds), len(val_ds),
-    )
-
-    # Compute class weights for balanced training
-    label_counts = train_ds.get_label_counts()
-    logging.info(
-        "Label distribution: UP=%d, FLAT=%d, DOWN=%d",
-        label_counts[0], label_counts[1], label_counts[2],
-    )
-    class_weights = None
-    if label_counts.min() > 0:
-        inv_freq = 1.0 / label_counts.astype(np.float64)
-        normed = (inv_freq / inv_freq.sum()) * 3
-        class_weights = torch.tensor(normed, dtype=torch.float32)
-
-    trainer = Trainer(
-        num_features=len(feature_cols),
-        hidden_dim=hidden_dim,
-        num_layers=2,
-        dropout=0.3,
-        lr=1e-3,
-        batch_size=64,
-        max_epochs=epochs,
-        patience=patience,
-        class_weights=class_weights,
-    )
-
-    history = trainer.fit(
-        train_ds, val_ds, tag="retrain", use_sample_weights=use_weights
-    )
-
-    # Step 6: Calibrate temperature
-    logging.info("Step 6/8: Calibrating probability temperature...")
-    trainer.calibrate_temperature(val_ds)
-
-    final_path = trainer.save_final()
-
-    # Step 7: Permutation importance
-    logging.info("Step 7/8: Computing permutation importance...")
-    importance_text = None
-    try:
-        importances = compute_permutation_importance(
-            model=trainer.model,
-            dataset=val_ds,
-            feature_names=feature_cols,
-            device=trainer.device,
-            n_repeats=3,
+    # Steps 5..5+N: Train each timeframe
+    trained_models = []
+    for interval, window_size in timeframes_to_train:
+        step += 1
+        logging.info(
+            "Step %d/%d: Retraining %sm model (%d-day window, epochs=%d, patience=%d)...",
+            step, total_steps, interval, rolling_days, epochs, patience,
         )
-        importance_text = format_importance_report(importances)
-        logging.info("\n%s", importance_text)
-    except Exception as exc:
-        logging.warning("Permutation importance failed: %s", exc)
+        final_path, history = _train_single_timeframe(
+            db_path=args.db,
+            interval=interval,
+            window_size=window_size,
+            hidden_dim=hidden_dim,
+            rolling_days=rolling_days,
+            epochs=epochs,
+            patience=patience,
+            folds=folds,
+            new_threshold=new_threshold,
+            symbol_weights=symbol_weights,
+            feature_cols=feature_cols,
+        )
+        if final_path:
+            trained_models.append((interval, final_path, history))
 
-    # Step 8: Send digest
-    logging.info("Step 8/8: Sending accuracy digest...")
+    # Final step: Send digest
+    step += 1
+    logging.info("Step %d/%d: Sending accuracy digest...", step, total_steps)
     asyncio.run(
-        send_accuracy_digest(config, report, new_threshold, old_threshold, importance_text)
+        send_accuracy_digest(config, report, new_threshold, old_threshold, None)
     )
 
     elapsed = (datetime.now(timezone.utc) - start).total_seconds()
     logging.info("=" * 60)
     logging.info("Retrain complete in %.1f seconds", elapsed)
-    logging.info("Model saved to: %s", final_path)
-    logging.info(
-        "Final metrics: val_loss=%.4f  val_acc=%.2f%%  val_mae=%.4f",
-        history["val_loss"][-1],
-        history["val_cls_acc"][-1] * 100,
-        history["val_reg_mae"][-1],
-    )
+    for interval, path, history in trained_models:
+        if history:
+            logging.info(
+                "[%sm] Model saved to: %s  val_loss=%.4f  val_acc=%.2f%%  val_mae=%.4f",
+                interval, path,
+                history["val_loss"][-1],
+                history["val_cls_acc"][-1] * 100,
+                history["val_reg_mae"][-1],
+            )
     logging.info("=" * 60)
 
 

@@ -28,20 +28,22 @@ CREATE TABLE IF NOT EXISTS ohlcv (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol     TEXT    NOT NULL,
     ts         TEXT    NOT NULL,
+    interval   TEXT    NOT NULL DEFAULT '60',
     open       REAL    NOT NULL,
     high       REAL    NOT NULL,
     low        REAL    NOT NULL,
     close      REAL    NOT NULL,
     volume     REAL    NOT NULL DEFAULT 0,
-    UNIQUE(symbol, ts)
+    UNIQUE(symbol, ts, interval)
 );
 
-CREATE INDEX IF NOT EXISTS idx_ohlcv_symbol_ts ON ohlcv(symbol, ts);
+CREATE INDEX IF NOT EXISTS idx_ohlcv_sym_ts_int ON ohlcv(symbol, ts, interval);
 
 CREATE TABLE IF NOT EXISTS predictions (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol           TEXT    NOT NULL,
     ts               TEXT    NOT NULL,
+    interval         TEXT    NOT NULL DEFAULT '60',
     direction        TEXT    NOT NULL,
     prob_up          REAL,
     prob_flat        REAL,
@@ -53,10 +55,10 @@ CREATE TABLE IF NOT EXISTS predictions (
     was_correct      INTEGER,
     scored_at        TEXT,
     created_at       TEXT    DEFAULT (datetime('now')),
-    UNIQUE(symbol, ts)
+    UNIQUE(symbol, ts, interval)
 );
 
-CREATE INDEX IF NOT EXISTS idx_pred_symbol_ts ON predictions(symbol, ts);
+CREATE INDEX IF NOT EXISTS idx_pred_sym_ts_int ON predictions(symbol, ts, interval);
 CREATE INDEX IF NOT EXISTS idx_pred_unscored ON predictions(scored_at) WHERE scored_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS accuracy_log (
@@ -113,19 +115,100 @@ class Storage:
     async def _migrate(self) -> None:
         """Add columns that may not exist in older databases."""
         assert self._db is not None
-        migrations = [
+
+        # Check if ohlcv table needs interval column + constraint migration
+        cursor = await self._db.execute("PRAGMA table_info(ohlcv)")
+        ohlcv_cols = [row[1] for row in await cursor.fetchall()]
+
+        if "interval" not in ohlcv_cols:
+            logger.info("Migrating ohlcv table to add interval column...")
+            await self._db.executescript("""
+                ALTER TABLE ohlcv RENAME TO _ohlcv_old;
+
+                CREATE TABLE ohlcv (
+                    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol   TEXT NOT NULL,
+                    ts       TEXT NOT NULL,
+                    interval TEXT NOT NULL DEFAULT '60',
+                    open     REAL NOT NULL,
+                    high     REAL NOT NULL,
+                    low      REAL NOT NULL,
+                    close    REAL NOT NULL,
+                    volume   REAL NOT NULL DEFAULT 0,
+                    UNIQUE(symbol, ts, interval)
+                );
+
+                INSERT OR IGNORE INTO ohlcv
+                    (symbol, ts, interval, open, high, low, close, volume)
+                SELECT symbol, ts, '60', open, high, low, close, volume
+                FROM _ohlcv_old;
+
+                DROP TABLE _ohlcv_old;
+
+                CREATE INDEX IF NOT EXISTS idx_ohlcv_sym_ts_int
+                    ON ohlcv(symbol, ts, interval);
+            """)
+            logger.info("ohlcv migration complete")
+
+        # Check if predictions table needs interval column
+        cursor = await self._db.execute("PRAGMA table_info(predictions)")
+        pred_cols = [row[1] for row in await cursor.fetchall()]
+
+        if "interval" not in pred_cols:
+            logger.info("Migrating predictions table to add interval column...")
+            await self._db.executescript("""
+                ALTER TABLE predictions RENAME TO _predictions_old;
+
+                CREATE TABLE predictions (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol           TEXT NOT NULL,
+                    ts               TEXT NOT NULL,
+                    interval         TEXT NOT NULL DEFAULT '60',
+                    direction        TEXT NOT NULL,
+                    prob_up          REAL,
+                    prob_flat        REAL,
+                    prob_down        REAL,
+                    magnitude        REAL,
+                    signal_score     REAL,
+                    actual_direction TEXT,
+                    actual_magnitude REAL,
+                    was_correct      INTEGER,
+                    scored_at        TEXT,
+                    created_at       TEXT DEFAULT (datetime('now')),
+                    UNIQUE(symbol, ts, interval)
+                );
+
+                INSERT OR IGNORE INTO predictions
+                    (symbol, ts, interval, direction, prob_up, prob_flat,
+                     prob_down, magnitude, signal_score, actual_direction,
+                     actual_magnitude, was_correct, scored_at, created_at)
+                SELECT symbol, ts, '60', direction, prob_up, prob_flat,
+                       prob_down, magnitude, signal_score, actual_direction,
+                       actual_magnitude, was_correct, scored_at, created_at
+                FROM _predictions_old;
+
+                DROP TABLE _predictions_old;
+
+                CREATE INDEX IF NOT EXISTS idx_pred_sym_ts_int
+                    ON predictions(symbol, ts, interval);
+                CREATE INDEX IF NOT EXISTS idx_pred_unscored
+                    ON predictions(scored_at) WHERE scored_at IS NULL;
+            """)
+            logger.info("predictions migration complete")
+
+        # Legacy column migrations for very old databases
+        for table, col, col_type in [
             ("predictions", "actual_direction", "TEXT"),
             ("predictions", "actual_magnitude", "REAL"),
             ("predictions", "was_correct", "INTEGER"),
             ("predictions", "scored_at", "TEXT"),
-        ]
-        for table, col, col_type in migrations:
+        ]:
             try:
                 await self._db.execute(
                     f"ALTER TABLE {table} ADD COLUMN {col} {col_type}"
                 )
             except Exception:
-                pass  # column already exists
+                pass
         await self._db.commit()
 
     async def close(self) -> None:
@@ -143,18 +226,23 @@ class Storage:
     # ------------------------------------------------------------------
     # OHLCV operations
     # ------------------------------------------------------------------
-    async def insert_candles(self, rows: List[Tuple]) -> int:
+    async def insert_candles(self, rows: List[Tuple], interval: str = "60") -> int:
         """
-        Bulk-insert candles. Each row is (symbol, ts, open, high, low, close, volume).
-        Duplicates on (symbol, ts) are silently ignored.
+        Bulk-insert candles.
+        Each row is (symbol, ts, open, high, low, close, volume).
+        The interval is appended automatically.
+        Duplicates on (symbol, ts, interval) are silently ignored.
         Returns the number of rows actually inserted.
         """
         assert self._db is not None
         sql = """
-            INSERT OR IGNORE INTO ohlcv (symbol, ts, open, high, low, close, volume)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT OR IGNORE INTO ohlcv (symbol, ts, interval, open, high, low, close, volume)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """
-        cursor = await self._db.executemany(sql, rows)
+        rows_with_interval = [
+            (r[0], r[1], interval, r[2], r[3], r[4], r[5], r[6]) for r in rows
+        ]
+        cursor = await self._db.executemany(sql, rows_with_interval)
         await self._db.commit()
         return cursor.rowcount
 
@@ -163,27 +251,28 @@ class Storage:
         symbol: str,
         limit: int = 500,
         before_ts: Optional[str] = None,
+        interval: str = "60",
     ) -> pd.DataFrame:
-        """Return candles for *symbol* as a DataFrame, ordered by ts ascending."""
+        """Return candles for *symbol* at *interval* as a DataFrame, ordered by ts ascending."""
         assert self._db is not None
         if before_ts:
             sql = """
                 SELECT symbol, ts, open, high, low, close, volume
                 FROM ohlcv
-                WHERE symbol = ? AND ts < ?
+                WHERE symbol = ? AND interval = ? AND ts < ?
                 ORDER BY ts ASC
                 LIMIT ?
             """
-            params: Tuple = (symbol, before_ts, limit)
+            params: Tuple = (symbol, interval, before_ts, limit)
         else:
             sql = """
                 SELECT symbol, ts, open, high, low, close, volume
                 FROM ohlcv
-                WHERE symbol = ?
+                WHERE symbol = ? AND interval = ?
                 ORDER BY ts DESC
                 LIMIT ?
             """
-            params = (symbol, limit)
+            params = (symbol, interval, limit)
 
         rows = await self._db.execute_fetchall(sql, params)
         df = pd.DataFrame(
@@ -193,11 +282,12 @@ class Storage:
             df = df.iloc[::-1].reset_index(drop=True)
         return df
 
-    async def get_latest_ts(self, symbol: str) -> Optional[str]:
-        """Return the most recent candle timestamp for *symbol*, or None."""
+    async def get_latest_ts(self, symbol: str, interval: str = "60") -> Optional[str]:
+        """Return the most recent candle timestamp for *symbol* at *interval*, or None."""
         assert self._db is not None
         row = await self._db.execute_fetchall(
-            "SELECT MAX(ts) FROM ohlcv WHERE symbol = ?", (symbol,)
+            "SELECT MAX(ts) FROM ohlcv WHERE symbol = ? AND interval = ?",
+            (symbol, interval),
         )
         if row and row[0][0]:
             return row[0][0]
@@ -225,18 +315,22 @@ class Storage:
     # ------------------------------------------------------------------
     # Prediction operations
     # ------------------------------------------------------------------
-    async def insert_predictions(self, rows: List[Tuple]) -> int:
+    async def insert_predictions(self, rows: List[Tuple], interval: str = "60") -> int:
         """
         Bulk-insert predictions.
         Each row: (symbol, ts, direction, prob_up, prob_flat, prob_down, magnitude, signal_score)
+        The interval is appended automatically.
         """
         assert self._db is not None
         sql = """
             INSERT OR REPLACE INTO predictions
-                (symbol, ts, direction, prob_up, prob_flat, prob_down, magnitude, signal_score)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (symbol, ts, interval, direction, prob_up, prob_flat, prob_down, magnitude, signal_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
-        cursor = await self._db.executemany(sql, rows)
+        rows_with_interval = [
+            (r[0], r[1], interval, r[2], r[3], r[4], r[5], r[6], r[7]) for r in rows
+        ]
+        cursor = await self._db.executemany(sql, rows_with_interval)
         await self._db.commit()
         return cursor.rowcount
 

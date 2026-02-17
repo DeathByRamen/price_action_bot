@@ -83,6 +83,24 @@ retrain:
   folds: 3                # walk-forward CV folds
 
 # ---------------------------------------------------------------
+# Multi-timeframe settings
+# When enabled, two models run in parallel: a longer timeframe
+# for directional bias and a shorter one for entry timing.
+# ---------------------------------------------------------------
+timeframes:
+  enabled: true
+  primary:
+    interval: "60"                              # 1h candles — directional bias
+    window_size: 168                            # 7 days of 1h candles
+    checkpoint: "data/models/model_final_60.pt"
+    weight: 0.6                                 # ensemble weight
+  secondary:
+    interval: "15"                              # 15m candles — entry timing
+    window_size: 672                            # 7 days of 15m candles (168 * 4)
+    checkpoint: "data/models/model_final_15.pt"
+    weight: 0.4                                 # ensemble weight
+
+# ---------------------------------------------------------------
 # Backfill settings
 # ---------------------------------------------------------------
 backfill:
