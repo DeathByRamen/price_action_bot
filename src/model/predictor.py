@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from src.features.indicators import compute_indicators, get_feature_columns
+from src.features.indicators import compute_indicators, get_feature_columns, MAX_WARMUP_PERIODS
 from .architecture import CryptoPredictorLSTM
 
 logger = logging.getLogger(__name__)
@@ -75,11 +75,31 @@ class Predictor:
 
         path = model_path or DEFAULT_MODEL_PATH
         if os.path.exists(path):
-            self.model.load_state_dict(
-                torch.load(path, map_location=self.device, weights_only=True)
-            )
-            logger.info("Loaded model from %s (temperature=%.4f)",
-                        path, self.model.temperature.item())
+            data = torch.load(path, map_location=self.device, weights_only=False)
+            if isinstance(data, dict) and "model_state_dict" in data:
+                ckpt_feats = data.get("num_features")
+                ckpt_hidden = data.get("hidden_dim")
+                if ckpt_feats and ckpt_feats != num_features:
+                    raise RuntimeError(
+                        f"Checkpoint expects {ckpt_feats} features but model "
+                        f"has {num_features}. Retrain required."
+                    )
+                if ckpt_hidden and ckpt_hidden != hidden_dim:
+                    raise RuntimeError(
+                        f"Checkpoint expects hidden_dim={ckpt_hidden} but model "
+                        f"has {hidden_dim}. Config mismatch."
+                    )
+                self.model.load_state_dict(data["model_state_dict"])
+                logger.info(
+                    "Loaded model from %s (temperature=%.4f, created=%s)",
+                    path, self.model.temperature.item(),
+                    data.get("created_at", "unknown"),
+                )
+            else:
+                # Legacy checkpoint: plain state_dict
+                self.model.load_state_dict(data)
+                logger.info("Loaded model from %s (legacy, temperature=%.4f)",
+                            path, self.model.temperature.item())
         else:
             logger.warning("No model checkpoint at %s -- predictions will be random!", path)
 
@@ -97,10 +117,11 @@ class Predictor:
         The DataFrame must have at least ``window_size + 50`` rows (50 for
         indicator warm-up) and columns: open, high, low, close, volume.
         """
-        if len(df) < self.window_size + 50:
+        min_rows = self.window_size + MAX_WARMUP_PERIODS
+        if len(df) < min_rows:
             logger.debug(
                 "%s: insufficient data (%d rows, need %d)",
-                symbol, len(df), self.window_size + 50,
+                symbol, len(df), min_rows,
             )
             return None
 
@@ -170,6 +191,107 @@ class Predictor:
             feature_attention=feat_attention,
             temporal_attention=temp_attention,
         )
+
+    def predict_batch(
+        self,
+        symbol_dfs: Dict[str, pd.DataFrame],
+        return_attention: bool = False,
+    ) -> List[Prediction]:
+        """
+        Generate predictions for many symbols in a single batched forward pass.
+
+        Parameters
+        ----------
+        symbol_dfs : dict[str, pd.DataFrame]
+            Mapping from symbol name to its OHLCV DataFrame (raw, before indicators).
+        return_attention : bool
+            Whether to include attention weights in each Prediction.
+
+        Returns
+        -------
+        List of Prediction objects (unranked).
+        """
+        min_rows = self.window_size + MAX_WARMUP_PERIODS
+
+        # Step 1: Prepare all valid windows
+        valid_symbols: List[str] = []
+        windows: List[np.ndarray] = []
+        prices: List[float] = []
+
+        for symbol, df in symbol_dfs.items():
+            if len(df) < min_rows:
+                continue
+            df_ind = compute_indicators(df.copy())
+            df_ind = df_ind.dropna().reset_index(drop=True)
+            if len(df_ind) < self.window_size:
+                continue
+
+            feature_data = df_ind[self.feature_cols].values.astype(np.float32)
+            window = feature_data[-self.window_size:]
+
+            # Per-window Z-score normalization
+            means = np.nanmean(window, axis=0, keepdims=True)
+            stds = np.nanstd(window, axis=0, keepdims=True)
+            stds[stds == 0] = 1.0
+            window = (window - means) / stds
+            window = np.nan_to_num(window, nan=0.0, posinf=0.0, neginf=0.0)
+
+            valid_symbols.append(symbol)
+            windows.append(window)
+            prices.append(float(df_ind["close"].iloc[-1]))
+
+        if not windows:
+            return []
+
+        # Step 2: Single batched forward pass
+        batch = torch.from_numpy(np.stack(windows, axis=0)).to(self.device)
+
+        with torch.no_grad():
+            if return_attention:
+                cls_logits, mag_pred, feat_w, temp_w = self.model(
+                    batch, return_attention=True
+                )
+            else:
+                cls_logits, mag_pred = self.model(batch)
+                feat_w = temp_w = None
+
+            temperature = self.model.temperature.clamp(min=0.01)
+            scaled_logits = cls_logits / temperature
+            all_probs = torch.softmax(scaled_logits, dim=1).cpu().numpy()
+            all_mags = mag_pred.squeeze(-1).cpu().numpy()
+
+        # Step 3: Build Prediction objects
+        predictions: List[Prediction] = []
+        for i, symbol in enumerate(valid_symbols):
+            probs = all_probs[i]
+            magnitude = float(all_mags[i])
+            direction_idx = int(np.argmax(probs))
+            direction = DIRECTION_LABELS[direction_idx]
+            conviction, signal_score = _compute_signal_score(probs, magnitude)
+
+            feat_attention = None
+            temp_attention = None
+            if feat_w is not None:
+                avg_feat = feat_w[i].mean(dim=0).cpu().numpy()
+                feat_attention = dict(zip(self.feature_cols, avg_feat.tolist()))
+            if temp_w is not None:
+                temp_attention = temp_w[i].cpu().numpy()
+
+            predictions.append(Prediction(
+                symbol=symbol,
+                direction=direction,
+                prob_up=float(probs[0]),
+                prob_flat=float(probs[1]),
+                prob_down=float(probs[2]),
+                magnitude=magnitude,
+                signal_score=signal_score,
+                conviction=conviction,
+                current_price=prices[i],
+                feature_attention=feat_attention,
+                temporal_attention=temp_attention,
+            ))
+
+        return predictions
 
     def rank_predictions(self, predictions: List[Prediction]) -> List[Prediction]:
         """Sort predictions by signal_score descending (strongest conviction first)."""

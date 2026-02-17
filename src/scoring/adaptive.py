@@ -62,24 +62,57 @@ async def compute_optimal_threshold(
     if actual_mags.empty:
         return current_threshold
 
-    # Test a range of thresholds and pick the one that maximizes accuracy
+    # Split into 70/30 tune/eval to prevent overfitting
+    df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+    split_idx = int(len(df) * 0.7)
+    tune_df = df.iloc[:split_idx]
+    eval_df = df.iloc[split_idx:]
+
+    if tune_df.empty or eval_df.empty:
+        return current_threshold
+
+    # Test a range of thresholds on the tune set
     candidates = np.linspace(cfg.flat_threshold_min, cfg.flat_threshold_max, 50)
     best_threshold = current_threshold
-    best_accuracy = 0.0
+    best_tune_accuracy = 0.0
 
     for thresh in candidates:
-        # Re-classify actuals with this threshold
-        actual_dirs = df["actual_magnitude"].apply(
+        actual_dirs = tune_df["actual_magnitude"].apply(
             lambda m: "UP" if float(m) > thresh else ("DOWN" if float(m) < -thresh else "FLAT")
         )
-        # Re-classify predictions with this threshold
-        pred_dirs = df["magnitude"].apply(
+        pred_dirs = tune_df["magnitude"].apply(
             lambda m: "UP" if float(m) > thresh else ("DOWN" if float(m) < -thresh else "FLAT")
         )
         accuracy = (pred_dirs == actual_dirs).mean()
-        if accuracy > best_accuracy:
-            best_accuracy = accuracy
+        if accuracy > best_tune_accuracy:
+            best_tune_accuracy = accuracy
             best_threshold = float(thresh)
+
+    # Validate on the eval set — only accept if it improves
+    eval_actual = eval_df["actual_magnitude"].apply(
+        lambda m: "UP" if float(m) > best_threshold else ("DOWN" if float(m) < -best_threshold else "FLAT")
+    )
+    eval_pred = eval_df["magnitude"].apply(
+        lambda m: "UP" if float(m) > best_threshold else ("DOWN" if float(m) < -best_threshold else "FLAT")
+    )
+    eval_accuracy = (eval_pred == eval_actual).mean()
+
+    curr_actual = eval_df["actual_magnitude"].apply(
+        lambda m: "UP" if float(m) > current_threshold else ("DOWN" if float(m) < -current_threshold else "FLAT")
+    )
+    curr_pred = eval_df["magnitude"].apply(
+        lambda m: "UP" if float(m) > current_threshold else ("DOWN" if float(m) < -current_threshold else "FLAT")
+    )
+    curr_eval_accuracy = (curr_pred == curr_actual).mean()
+
+    if eval_accuracy <= curr_eval_accuracy:
+        logger.info(
+            "Threshold tuning: optimal=%.4f (eval=%.1f%%) did not beat current=%.4f "
+            "(eval=%.1f%%). Keeping current.",
+            best_threshold, eval_accuracy * 100,
+            current_threshold, curr_eval_accuracy * 100,
+        )
+        return current_threshold
 
     # EMA smooth: new = alpha * optimal + (1-alpha) * current
     smoothed = cfg.threshold_ema_alpha * best_threshold + (1 - cfg.threshold_ema_alpha) * current_threshold
@@ -88,11 +121,13 @@ async def compute_optimal_threshold(
     smoothed = max(cfg.flat_threshold_min, min(cfg.flat_threshold_max, smoothed))
 
     logger.info(
-        "Threshold tuning: optimal=%.4f, smoothed=%.4f (was %.4f, accuracy=%.1f%%)",
+        "Threshold tuning: optimal=%.4f, smoothed=%.4f (was %.4f, "
+        "tune_acc=%.1f%%, eval_acc=%.1f%%)",
         best_threshold,
         smoothed,
         current_threshold,
-        best_accuracy * 100,
+        best_tune_accuracy * 100,
+        eval_accuracy * 100,
     )
 
     return smoothed

@@ -22,6 +22,10 @@ from ta.volume import OnBalanceVolumeIndicator, AccDistIndexIndicator
 
 logger = logging.getLogger(__name__)
 
+# Longest lookback required by any indicator (pct_change_168, rolling(168)).
+# Consumers must ensure at least this many rows precede the prediction window.
+MAX_WARMUP_PERIODS = 168
+
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -217,3 +221,53 @@ def normalize_features(df: pd.DataFrame, feature_cols: list[str] | None = None) 
         else:
             out[col] = 0.0
     return out
+
+
+def check_feature_correlation(
+    df: pd.DataFrame,
+    feature_cols: list[str] | None = None,
+    threshold: float = 0.95,
+) -> list[tuple[str, str, float]]:
+    """
+    Detect highly correlated feature pairs and log warnings.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame containing computed feature columns.
+    feature_cols : list[str] | None
+        Features to check (defaults to ``get_feature_columns()``).
+    threshold : float
+        Pearson correlation above which a pair is flagged.
+
+    Returns
+    -------
+    List of (feature_a, feature_b, correlation) tuples with |r| > threshold.
+    """
+    cols = feature_cols or get_feature_columns()
+    available = [c for c in cols if c in df.columns]
+    if len(available) < 2:
+        return []
+
+    corr_matrix = df[available].corr().abs()
+    flagged: list[tuple[str, str, float]] = []
+
+    for i in range(len(available)):
+        for j in range(i + 1, len(available)):
+            r = corr_matrix.iloc[i, j]
+            if r > threshold:
+                pair = (available[i], available[j], round(float(r), 4))
+                flagged.append(pair)
+                logger.warning(
+                    "High correlation (%.4f) between '%s' and '%s' — "
+                    "consider removing one to reduce redundancy",
+                    r, available[i], available[j],
+                )
+
+    if not flagged:
+        logger.info(
+            "Feature correlation check passed: no pairs above %.2f threshold",
+            threshold,
+        )
+
+    return flagged

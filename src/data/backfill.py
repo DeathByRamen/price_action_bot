@@ -38,6 +38,9 @@ async def run_backfill(
     """
     Backfill historical kline data from BitUnix.
 
+    Supports **resume**: checks how many candles already exist per symbol
+    and only fetches the remaining. Fully backfilled symbols are skipped.
+
     If *symbols* is None, we first discover all futures pairs from the
     tickers endpoint, then filter to only those with a matching spot pair
     (since kline history comes from the spot API).
@@ -50,7 +53,6 @@ async def run_backfill(
 
         if symbols is None:
             futures_symbols = await collector.discover_futures_symbols()
-            # Only keep futures symbols that also have a spot pair
             symbols = [
                 s for s in futures_symbols
                 if s.lower() in spot_symbols
@@ -61,7 +63,6 @@ async def run_backfill(
                 len(symbols), skipped,
             )
         else:
-            # User-specified symbols — warn about any that don't exist on spot
             missing = [s for s in symbols if s.lower() not in spot_symbols]
             if missing:
                 logger.warning(
@@ -69,8 +70,33 @@ async def run_backfill(
                     ", ".join(missing),
                 )
 
+        # Resume logic: check existing candle counts per symbol
+        symbols_to_fetch: list[str] = []
+        candles_needed: dict[str, int] = {}
+        already_complete = 0
+
+        for sym in symbols:
+            existing = await storage.candle_count_for_symbol(sym, interval=interval)
+            if existing >= total_candles:
+                already_complete += 1
+                continue
+            remaining = total_candles - existing
+            symbols_to_fetch.append(sym)
+            candles_needed[sym] = remaining
+
+        if already_complete:
+            logger.info(
+                "Backfill resume: %d symbols already complete, %d need more data",
+                already_complete, len(symbols_to_fetch),
+            )
+
+        if not symbols_to_fetch:
+            count = await storage.candle_count()
+            logger.info("Backfill: all symbols complete. DB total: %d rows", count)
+            return
+
         total = await collector.backfill_all(
-            symbols,
+            symbols_to_fetch,
             interval=interval,
             total_candles=total_candles,
             concurrency=concurrency,

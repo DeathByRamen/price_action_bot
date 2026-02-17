@@ -87,6 +87,16 @@ CREATE TABLE IF NOT EXISTS sample_weights (
     updated_at TEXT    DEFAULT (datetime('now')),
     UNIQUE(symbol)
 );
+
+CREATE TABLE IF NOT EXISTS feature_importance (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_date      TEXT    NOT NULL,
+    interval      TEXT    NOT NULL DEFAULT '60',
+    feature_name  TEXT    NOT NULL,
+    importance    REAL    NOT NULL DEFAULT 0.0,
+    created_at    TEXT    DEFAULT (datetime('now')),
+    UNIQUE(run_date, interval, feature_name)
+);
 """
 
 MIGRATION_SQL = """
@@ -312,6 +322,17 @@ class Storage:
             rows = await self._db.execute_fetchall("SELECT COUNT(*) FROM ohlcv")
         return rows[0][0]
 
+    async def candle_count_for_symbol(
+        self, symbol: str, interval: str = "60"
+    ) -> int:
+        """Return number of candle rows for a symbol at a specific interval."""
+        assert self._db is not None
+        rows = await self._db.execute_fetchall(
+            "SELECT COUNT(*) FROM ohlcv WHERE symbol = ? AND interval = ?",
+            (symbol, interval),
+        )
+        return rows[0][0]
+
     # ------------------------------------------------------------------
     # Prediction operations
     # ------------------------------------------------------------------
@@ -377,8 +398,8 @@ class Storage:
         """Return predictions that have not yet been scored against actuals."""
         assert self._db is not None
         sql = """
-            SELECT id, symbol, ts, direction, prob_up, prob_flat, prob_down,
-                   magnitude, signal_score, created_at
+            SELECT id, symbol, ts, interval, direction, prob_up, prob_flat,
+                   prob_down, magnitude, signal_score, created_at
             FROM predictions
             WHERE scored_at IS NULL AND ts != ''
             ORDER BY ts ASC
@@ -387,8 +408,9 @@ class Storage:
         return pd.DataFrame(
             rows,
             columns=[
-                "id", "symbol", "ts", "direction", "prob_up", "prob_flat",
-                "prob_down", "magnitude", "signal_score", "created_at",
+                "id", "symbol", "ts", "interval", "direction", "prob_up",
+                "prob_flat", "prob_down", "magnitude", "signal_score",
+                "created_at",
             ],
         )
 
@@ -418,69 +440,78 @@ class Storage:
         await self._db.commit()
 
     async def get_scored_predictions(
-        self, days: int = 7, symbol: Optional[str] = None
+        self,
+        days: int = 7,
+        symbol: Optional[str] = None,
+        interval: Optional[str] = None,
     ) -> pd.DataFrame:
-        """Return scored predictions from the last N days."""
+        """
+        Return scored predictions from the last N days.
+
+        Parameters
+        ----------
+        interval : str | None
+            If set, only return predictions for this candle interval.
+            If None, returns all intervals (backward-compatible).
+        """
         assert self._db is not None
+
+        conditions = ["scored_at IS NOT NULL", "scored_at >= datetime('now', ?)"]
+        params: list = [f"-{days} days"]
+
         if symbol:
-            sql = """
-                SELECT symbol, ts, direction, prob_up, prob_flat, prob_down,
-                       magnitude, actual_direction, actual_magnitude, was_correct,
-                       scored_at
-                FROM predictions
-                WHERE scored_at IS NOT NULL
-                  AND scored_at >= datetime('now', ?)
-                  AND symbol = ?
-                ORDER BY ts DESC
-            """
-            rows = await self._db.execute_fetchall(
-                sql, (f"-{days} days", symbol)
-            )
-        else:
-            sql = """
-                SELECT symbol, ts, direction, prob_up, prob_flat, prob_down,
-                       magnitude, actual_direction, actual_magnitude, was_correct,
-                       scored_at
-                FROM predictions
-                WHERE scored_at IS NOT NULL
-                  AND scored_at >= datetime('now', ?)
-                ORDER BY ts DESC
-            """
-            rows = await self._db.execute_fetchall(sql, (f"-{days} days",))
+            conditions.append("symbol = ?")
+            params.append(symbol)
+        if interval:
+            conditions.append("interval = ?")
+            params.append(interval)
+
+        where = " AND ".join(conditions)
+        sql = f"""
+            SELECT symbol, ts, interval, direction, prob_up, prob_flat, prob_down,
+                   magnitude, actual_direction, actual_magnitude, was_correct,
+                   scored_at
+            FROM predictions
+            WHERE {where}
+            ORDER BY ts DESC
+        """
+        rows = await self._db.execute_fetchall(sql, tuple(params))
 
         return pd.DataFrame(
             rows,
             columns=[
-                "symbol", "ts", "direction", "prob_up", "prob_flat", "prob_down",
-                "magnitude", "actual_direction", "actual_magnitude", "was_correct",
-                "scored_at",
+                "symbol", "ts", "interval", "direction", "prob_up", "prob_flat",
+                "prob_down", "magnitude", "actual_direction", "actual_magnitude",
+                "was_correct", "scored_at",
             ],
         )
 
-    async def get_close_at_ts(self, symbol: str, ts: str) -> Optional[float]:
-        """Return the close price for a symbol at a specific timestamp."""
+    async def get_close_at_ts(
+        self, symbol: str, ts: str, interval: str = "60"
+    ) -> Optional[float]:
+        """Return the close price for a symbol at a specific timestamp and interval."""
         assert self._db is not None
         rows = await self._db.execute_fetchall(
-            "SELECT close FROM ohlcv WHERE symbol = ? AND ts = ? LIMIT 1",
-            (symbol, ts),
+            "SELECT close FROM ohlcv WHERE symbol = ? AND ts = ? AND interval = ? LIMIT 1",
+            (symbol, ts, interval),
         )
         if rows:
             return float(rows[0][0])
         return None
 
     async def get_next_candle_close(
-        self, symbol: str, ts: str
+        self, symbol: str, ts: str, interval: str = "60"
     ) -> Optional[Tuple[str, float]]:
-        """Return (ts, close) for the first candle strictly after *ts*."""
+        """Return (ts, close) for the first candle strictly after *ts* at the given *interval*."""
         assert self._db is not None
         rows = await self._db.execute_fetchall(
             """
             SELECT ts, close FROM ohlcv
-            WHERE symbol = ? AND ts > ?
+            WHERE symbol = ? AND interval = ? AND ts > ?
             ORDER BY ts ASC
             LIMIT 1
             """,
-            (symbol, ts),
+            (symbol, interval, ts),
         )
         if rows:
             return (rows[0][0], float(rows[0][1]))
@@ -508,6 +539,28 @@ class Storage:
             row,
         )
         await self._db.commit()
+
+    async def get_recent_interval_accuracy(
+        self, interval: str, days: int = 7
+    ) -> Optional[float]:
+        """
+        Return the average direction accuracy for predictions at the given
+        interval over the last *days*. Returns None if no scored data.
+        """
+        assert self._db is not None
+        rows = await self._db.execute_fetchall(
+            """
+            SELECT AVG(CASE WHEN was_correct = 1 THEN 1.0 ELSE 0.0 END) as acc
+            FROM predictions
+            WHERE scored_at IS NOT NULL
+              AND interval = ?
+              AND scored_at >= datetime('now', ?)
+            """,
+            (interval, f"-{days} days"),
+        )
+        if rows and rows[0][0] is not None:
+            return float(rows[0][0])
+        return None
 
     async def get_accuracy_history(self, days: int = 30) -> pd.DataFrame:
         """Return accuracy log entries from the last N days."""
@@ -557,3 +610,57 @@ class Storage:
             "SELECT symbol, weight FROM sample_weights"
         )
         return {r[0]: float(r[1]) for r in rows}
+
+    # ------------------------------------------------------------------
+    # Feature importance operations
+    # ------------------------------------------------------------------
+    async def insert_feature_importance(
+        self, run_date: str, interval: str, importances: Dict[str, float]
+    ) -> None:
+        """
+        Insert or replace feature importance scores for a given run date + interval.
+        importances: {feature_name: importance_score}
+        """
+        assert self._db is not None
+        rows = [
+            (run_date, interval, name, score)
+            for name, score in importances.items()
+        ]
+        await self._db.executemany(
+            """
+            INSERT OR REPLACE INTO feature_importance
+                (run_date, interval, feature_name, importance)
+            VALUES (?, ?, ?, ?)
+            """,
+            rows,
+        )
+        await self._db.commit()
+
+    async def get_low_importance_features(
+        self, interval: str = "60", last_n_runs: int = 3, threshold: float = 0.001
+    ) -> List[Tuple[str, float]]:
+        """
+        Return features that scored below *threshold* for the last *last_n_runs*
+        consecutive daily runs at the given interval.
+
+        Returns list of (feature_name, avg_importance).
+        """
+        assert self._db is not None
+        rows = await self._db.execute_fetchall(
+            """
+            SELECT feature_name, AVG(importance) as avg_imp, COUNT(*) as n_runs
+            FROM feature_importance
+            WHERE interval = ?
+              AND run_date IN (
+                  SELECT DISTINCT run_date FROM feature_importance
+                  WHERE interval = ?
+                  ORDER BY run_date DESC
+                  LIMIT ?
+              )
+            GROUP BY feature_name
+            HAVING n_runs >= ? AND avg_imp < ?
+            ORDER BY avg_imp ASC
+            """,
+            (interval, interval, last_n_runs, last_n_runs, threshold),
+        )
+        return [(r[0], float(r[1])) for r in rows]

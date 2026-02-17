@@ -23,10 +23,12 @@ load_dotenv()
 from src.api.bitunix_client import BitunixClient
 from src.data.collector import DataCollector
 from src.data.storage import Storage
+from src.features.indicators import MAX_WARMUP_PERIODS
 from src.model.predictor import Prediction, Predictor
 from src.model.ensemble import (
     MultiTimeframePrediction,
     combine_timeframes,
+    compute_adaptive_weights,
     format_multi_timeframe_message,
 )
 from src.notifications.dispatcher import Dispatcher, Notifier
@@ -111,7 +113,7 @@ async def run_pipeline(
     hidden_dim = model_cfg.get("hidden_dim", 128)
     top_n = pipeline_cfg.get("top_n_signals", 10)
     lookback_candles = pipeline_cfg.get("lookback_candles", 10)
-    candle_limit = window_size + 100
+    candle_limit = window_size + MAX_WARMUP_PERIODS + 10
 
     # 1. Set up components
     dispatcher = build_dispatcher(config)
@@ -136,23 +138,33 @@ async def run_pipeline(
         )
         logger.info("Fetched %d new %sm candles", new_candles, interval)
 
-        # 4. For each symbol: load candles -> indicators -> predict
+        # 4. Load candles for all symbols, then batch-predict
         symbol_latest_ts: dict[str, str] = {}
+        symbol_dfs: dict[str, "pd.DataFrame"] = {}
         for symbol in symbols:
             try:
                 df = await storage.get_candles(
                     symbol, limit=candle_limit, interval=interval
                 )
-                if df.empty or len(df) < window_size + 50:
+                if df.empty or len(df) < window_size + MAX_WARMUP_PERIODS:
                     continue
-
                 symbol_latest_ts[symbol] = str(df["ts"].iloc[-1])
-
-                pred = predictor.predict_symbol(df, symbol)
-                if pred is not None:
-                    all_predictions.append(pred)
+                symbol_dfs[symbol] = df
             except Exception as exc:
-                logger.warning("Prediction failed for %s: %s", symbol, exc)
+                logger.warning("Failed to load candles for %s: %s", symbol, exc)
+
+        # Batch inference: single forward pass for all symbols
+        try:
+            all_predictions = predictor.predict_batch(symbol_dfs)
+        except Exception as exc:
+            logger.error("Batch prediction failed: %s — falling back to per-symbol", exc)
+            for symbol, df in symbol_dfs.items():
+                try:
+                    pred = predictor.predict_symbol(df, symbol)
+                    if pred is not None:
+                        all_predictions.append(pred)
+                except Exception as inner_exc:
+                    logger.warning("Prediction failed for %s: %s", symbol, inner_exc)
 
         logger.info("Generated %d predictions [%sm]", len(all_predictions), interval)
 
@@ -205,8 +217,8 @@ async def run_multi_timeframe_pipeline(
 
     primary_interval = primary_cfg.get("interval", "60")
     secondary_interval = secondary_cfg.get("interval", "15")
-    primary_weight = primary_cfg.get("weight", 0.6)
-    secondary_weight = secondary_cfg.get("weight", 0.4)
+    default_primary_weight = primary_cfg.get("weight", 0.6)
+    default_secondary_weight = secondary_cfg.get("weight", 0.4)
     primary_window = primary_cfg.get("window_size", 168)
     secondary_window = secondary_cfg.get("window_size", 672)
     primary_checkpoint = primary_cfg.get("checkpoint", "data/models/model_final_60.pt")
@@ -216,8 +228,20 @@ async def run_multi_timeframe_pipeline(
     primary_config = {**config, "model": {**config.get("model", {}), "window_size": primary_window}}
     secondary_config = {**config, "model": {**config.get("model", {}), "window_size": secondary_window}}
 
+    # Compute adaptive weights from recent per-interval accuracy
+    async with Storage(db_path) as storage:
+        pri_acc = await storage.get_recent_interval_accuracy(primary_interval, days=7)
+        sec_acc = await storage.get_recent_interval_accuracy(secondary_interval, days=7)
+
+    primary_weight, secondary_weight = compute_adaptive_weights(
+        primary_accuracy=pri_acc,
+        secondary_accuracy=sec_acc,
+        default_primary=default_primary_weight,
+        default_secondary=default_secondary_weight,
+    )
+
     logger.info(
-        "Multi-timeframe: %sm (weight=%.1f) + %sm (weight=%.1f)",
+        "Multi-timeframe: %sm (weight=%.3f) + %sm (weight=%.3f)",
         primary_interval, primary_weight, secondary_interval, secondary_weight,
     )
 

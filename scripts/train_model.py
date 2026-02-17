@@ -201,7 +201,7 @@ def main() -> None:
     if label_counts.min() > 0:
         inv_freq = 1.0 / label_counts.astype(np.float64)
         normed = (inv_freq / inv_freq.sum()) * 3  # scale to num_classes
-        class_weights = torch.tensor(normed, dtype=torch.float32)
+        class_weights = torch.tensor(normed, dtype=torch.float32).clamp(max=3.0)
         logging.info("Class weights: UP=%.3f, FLAT=%.3f, DOWN=%.3f",
                       class_weights[0], class_weights[1], class_weights[2])
 
@@ -223,7 +223,7 @@ def main() -> None:
     logging.info("Calibrating probability temperature on validation set...")
     trainer.calibrate_temperature(val_ds)
 
-    final_path = trainer.save_final(tag=f"final_{interval}")
+    final_path = trainer.save_final(tag=f"final_{interval}", feature_cols=feature_cols)
 
     logging.info("Training complete. Best model saved to: %s", final_path)
     logging.info(

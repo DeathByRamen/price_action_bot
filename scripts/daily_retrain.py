@@ -179,7 +179,7 @@ def format_accuracy_digest(
     return "\n".join(lines)
 
 
-def _train_single_timeframe(
+async def _train_single_timeframe(
     db_path: str | None,
     interval: str,
     window_size: int,
@@ -191,12 +191,12 @@ def _train_single_timeframe(
     new_threshold: float,
     symbol_weights: dict[str, float],
     feature_cols: list[str],
-) -> tuple[str, dict]:
-    """Train a single timeframe model and return (save_path, history)."""
+) -> tuple[str, dict, dict[str, float]]:
+    """Train a single timeframe model and return (save_path, history, importances)."""
     logging.info("--- Training %sm model (window=%d) ---", interval, window_size)
 
-    symbol_data = asyncio.run(
-        load_training_data(db_path, rolling_days=rolling_days, interval=interval)
+    symbol_data = await load_training_data(
+        db_path, rolling_days=rolling_days, interval=interval
     )
 
     use_weights = bool(symbol_weights)
@@ -212,7 +212,7 @@ def _train_single_timeframe(
 
     if not splits:
         logging.error("No valid splits for %sm model. Skipping.", interval)
-        return "", {}
+        return "", {}, {}
 
     train_ds, val_ds = splits[-1]
     logging.info(
@@ -230,6 +230,7 @@ def _train_single_timeframe(
         inv_freq = 1.0 / label_counts.astype(np.float64)
         normed = (inv_freq / inv_freq.sum()) * 3
         class_weights = torch.tensor(normed, dtype=torch.float32)
+        class_weights = class_weights.clamp(max=3.0)
 
     trainer = Trainer(
         num_features=len(feature_cols),
@@ -243,6 +244,7 @@ def _train_single_timeframe(
         class_weights=class_weights,
     )
 
+    # Synchronous training (blocks the event loop, which is fine here)
     history = trainer.fit(
         train_ds, val_ds, tag=f"retrain_{interval}", use_sample_weights=use_weights
     )
@@ -251,10 +253,54 @@ def _train_single_timeframe(
     logging.info("[%sm] Calibrating probability temperature...", interval)
     trainer.calibrate_temperature(val_ds)
 
-    final_path = trainer.save_final(tag=f"final_{interval}")
+    # Validate new model against old before deploying
+    new_metrics = trainer.evaluate(val_ds)
+    deploy_path = os.path.join(
+        trainer.checkpoint_dir, f"model_final_{interval}.pt"
+    )
 
-    # Permutation importance
-    importance_text = None
+    should_deploy = True
+    if os.path.exists(deploy_path):
+        try:
+            old_trainer = Trainer(
+                num_features=len(feature_cols),
+                hidden_dim=hidden_dim,
+                num_layers=2,
+                dropout=0.3,
+                lr=1e-3,
+                batch_size=64,
+                max_epochs=1,
+                patience=1,
+                class_weights=class_weights,
+            )
+            old_trainer.load(deploy_path)
+            old_metrics = old_trainer.evaluate(val_ds)
+
+            logging.info(
+                "[%sm] Validation gate: old val_loss=%.4f  new val_loss=%.4f",
+                interval, old_metrics["loss"], new_metrics["loss"],
+            )
+            if new_metrics["loss"] > old_metrics["loss"] * 1.05:
+                logging.warning(
+                    "[%sm] New model is worse (val_loss %.4f > %.4f * 1.05). "
+                    "Keeping old checkpoint.",
+                    interval, new_metrics["loss"], old_metrics["loss"],
+                )
+                should_deploy = False
+        except Exception as exc:
+            logging.warning(
+                "[%sm] Could not load old model for comparison: %s. Deploying new.",
+                interval, exc,
+            )
+
+    if should_deploy:
+        final_path = trainer.save_final(tag=f"final_{interval}", feature_cols=feature_cols)
+    else:
+        final_path = deploy_path
+        logging.info("[%sm] Rolled back to previous checkpoint: %s", interval, deploy_path)
+
+    # Permutation importance — persist scores to DB
+    importance_scores: dict[str, float] = {}
     try:
         importances = compute_permutation_importance(
             model=trainer.model,
@@ -263,30 +309,41 @@ def _train_single_timeframe(
             device=trainer.device,
             n_repeats=3,
         )
+        importance_scores = {name: score for name, score in importances}
         importance_text = format_importance_report(importances)
         logging.info("[%sm] Feature importance:\n%s", interval, importance_text)
+
+        # Persist to DB
+        run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        async with Storage(db_path) as storage:
+            await storage.insert_feature_importance(run_date, interval, importance_scores)
+        logging.info("Persisted %d importance scores for %sm", len(importance_scores), interval)
     except Exception as exc:
         logging.warning("[%sm] Permutation importance failed: %s", interval, exc)
 
-    return final_path, history
+    return final_path, history, importance_scores
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Daily model retrain (cron-friendly)")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default=os.path.join(os.path.dirname(__file__), "..", "config", "settings.yaml"),
-        help="Path to settings.yaml",
-    )
-    parser.add_argument("--db", type=str, default=None, help="Override SQLite DB path")
-    args = parser.parse_args()
+async def _get_low_importance_warnings(
+    db_path: str | None,
+    intervals: list[str],
+) -> str:
+    """Check for features consistently below importance threshold."""
+    lines: list[str] = []
+    async with Storage(db_path) as storage:
+        for interval in intervals:
+            low = await storage.get_low_importance_features(
+                interval=interval, last_n_runs=3, threshold=0.001
+            )
+            if low:
+                lines.append(f"\n**Low-importance features ({interval}m) — candidates for removal:**")
+                for name, avg_imp in low:
+                    lines.append(f"  - `{name}`: avg importance = {avg_imp:.6f}")
+    return "\n".join(lines)
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
 
+async def async_main(args: argparse.Namespace) -> None:
+    """Single-event-loop entrypoint for the entire daily retrain pipeline."""
     start = datetime.now(timezone.utc)
     logging.info("=" * 60)
     logging.info("PA Bot daily retrain starting at %s", start.isoformat())
@@ -322,20 +379,18 @@ def main() -> None:
 
     all_intervals = [tf[0] for tf in timeframes_to_train]
     n_timeframes = len(timeframes_to_train)
-    total_steps = 4 + n_timeframes + 1  # gap-fill, score, threshold, backup, N trains, digest
+    total_steps = 4 + n_timeframes + 1
 
     # Step 1: Gap-fill recent candles for all timeframes
     step = 1
     logging.info("Step %d/%d: Gap-filling candles for intervals: %s",
                   step, total_steps, ", ".join(f"{i}m" for i in all_intervals))
-    asyncio.run(gap_fill(args.db, intervals=all_intervals))
+    await gap_fill(args.db, intervals=all_intervals)
 
     # Step 2: Score predictions and tune
     step += 1
     logging.info("Step %d/%d: Scoring predictions and computing accuracy...", step, total_steps)
-    report, new_threshold, symbol_weights = asyncio.run(
-        run_scoring_and_tuning(args.db, scoring_cfg)
-    )
+    report, new_threshold, symbol_weights = await run_scoring_and_tuning(args.db, scoring_cfg)
 
     if report:
         logging.info(
@@ -364,7 +419,7 @@ def main() -> None:
             "Step %d/%d: Retraining %sm model (%d-day window, epochs=%d, patience=%d)...",
             step, total_steps, interval, rolling_days, epochs, patience,
         )
-        final_path, history = _train_single_timeframe(
+        final_path, history, _imp = await _train_single_timeframe(
             db_path=args.db,
             interval=interval,
             window_size=window_size,
@@ -380,12 +435,14 @@ def main() -> None:
         if final_path:
             trained_models.append((interval, final_path, history))
 
+    # Check for low-importance features across runs
+    low_imp_warnings = await _get_low_importance_warnings(args.db, all_intervals)
+
     # Final step: Send digest
     step += 1
     logging.info("Step %d/%d: Sending accuracy digest...", step, total_steps)
-    asyncio.run(
-        send_accuracy_digest(config, report, new_threshold, old_threshold, None)
-    )
+    extra_report = low_imp_warnings if low_imp_warnings else None
+    await send_accuracy_digest(config, report, new_threshold, old_threshold, extra_report)
 
     elapsed = (datetime.now(timezone.utc) - start).total_seconds()
     logging.info("=" * 60)
@@ -400,6 +457,25 @@ def main() -> None:
                 history["val_reg_mae"][-1],
             )
     logging.info("=" * 60)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Daily model retrain (cron-friendly)")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=os.path.join(os.path.dirname(__file__), "..", "config", "settings.yaml"),
+        help="Path to settings.yaml",
+    )
+    parser.add_argument("--db", type=str, default=None, help="Override SQLite DB path")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    asyncio.run(async_main(args))
 
 
 if __name__ == "__main__":

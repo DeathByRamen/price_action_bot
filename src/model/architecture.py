@@ -37,9 +37,12 @@ class CryptoPredictorLSTM(nn.Module):
         self.hidden_dim = hidden_dim
 
         # --- Feature gate (sigmoid, context-dependent) ---
-        # Each feature is independently gated [0, 1] at every timestep.
+        # Wider gate (F -> 4F -> 2F -> F) captures richer cross-feature
+        # interactions than the previous shallow (F -> 2F -> F) design.
         self.feature_gate = nn.Sequential(
-            nn.Linear(num_features, num_features * 2),
+            nn.Linear(num_features, num_features * 4),
+            nn.GELU(),
+            nn.Linear(num_features * 4, num_features * 2),
             nn.GELU(),
             nn.Linear(num_features * 2, num_features),
             nn.Sigmoid(),
@@ -61,6 +64,9 @@ class CryptoPredictorLSTM(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden_dim // 2, 1),
         )
+
+        # --- Residual connection: project input to hidden_dim for skip ---
+        self.input_proj = nn.Linear(num_features, hidden_dim)
 
         self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm(hidden_dim)
@@ -115,7 +121,9 @@ class CryptoPredictorLSTM(nn.Module):
         attn_weights = torch.softmax(attn_scores, dim=1)  # (B, T, 1)
         context = (lstm_out * attn_weights).sum(dim=1)     # (B, H)
 
-        context = self.layer_norm(self.dropout(context))
+        # 3b. Residual connection — project input mean to hidden_dim and add
+        residual = self.input_proj(x_gated.mean(dim=1))    # (B, H)
+        context = self.layer_norm(self.dropout(context) + residual)
 
         # 4. Dual heads
         cls_logits = self.cls_head(context)

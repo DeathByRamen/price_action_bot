@@ -47,6 +47,80 @@ class MultiTimeframePrediction:
     current_price: float
 
 
+def compute_adaptive_weights(
+    primary_accuracy: Optional[float] = None,
+    secondary_accuracy: Optional[float] = None,
+    default_primary: float = 0.6,
+    default_secondary: float = 0.4,
+) -> tuple[float, float]:
+    """
+    Compute ensemble weights from historical per-timeframe accuracy.
+
+    If both accuracies are available, weights are proportional to accuracy.
+    Otherwise, falls back to default config weights.
+    """
+    if primary_accuracy is not None and secondary_accuracy is not None:
+        total = primary_accuracy + secondary_accuracy
+        if total > 0:
+            w1 = primary_accuracy / total
+            w2 = secondary_accuracy / total
+            logger.info(
+                "Adaptive ensemble weights: primary=%.3f (acc=%.1f%%), "
+                "secondary=%.3f (acc=%.1f%%)",
+                w1, primary_accuracy * 100, w2, secondary_accuracy * 100,
+            )
+            return w1, w2
+
+    logger.info(
+        "Using default ensemble weights: primary=%.2f, secondary=%.2f",
+        default_primary, default_secondary,
+    )
+    return default_primary, default_secondary
+
+
+def _combine_probs_log_odds(
+    p1: np.ndarray,
+    p2: np.ndarray,
+    w1: float,
+    w2: float,
+) -> np.ndarray:
+    """
+    Combine two probability vectors using log-odds (statistically sound).
+
+    Converts softmax probabilities to log-odds space, takes weighted sum,
+    converts back, and normalizes.
+
+    Parameters
+    ----------
+    p1, p2 : np.ndarray of shape (3,) — [prob_up, prob_flat, prob_down]
+    w1, w2 : float — ensemble weights
+
+    Returns
+    -------
+    np.ndarray of shape (3,) — combined probabilities summing to 1.
+    """
+    eps = 1e-8
+    p1 = np.clip(p1, eps, 1.0 - eps)
+    p2 = np.clip(p2, eps, 1.0 - eps)
+
+    # Convert each probability to log-odds: log(p / (1-p))
+    lo1 = np.log(p1) - np.log(1.0 - p1)
+    lo2 = np.log(p2) - np.log(1.0 - p2)
+
+    # Weighted combination in log-odds space
+    combined_lo = w1 * lo1 + w2 * lo2
+
+    # Convert back to probabilities
+    combined_p = 1.0 / (1.0 + np.exp(-combined_lo))
+
+    # Normalize to sum to 1
+    total = combined_p.sum()
+    if total > 0:
+        combined_p /= total
+
+    return combined_p
+
+
 def combine_timeframes(
     primary_preds: List[Prediction],
     secondary_preds: List[Prediction],
@@ -55,6 +129,9 @@ def combine_timeframes(
 ) -> List[MultiTimeframePrediction]:
     """
     Combine predictions from two timeframes into an ensemble.
+
+    Uses log-odds probability combination (statistically sound) instead of
+    naive weighted averaging, and magnitude-aware conflict resolution.
 
     Parameters
     ----------
@@ -71,7 +148,6 @@ def combine_timeframes(
     -------
     List of MultiTimeframePrediction, sorted by combined_score descending.
     """
-    # Index secondary predictions by symbol for fast lookup
     sec_by_symbol: Dict[str, Prediction] = {p.symbol: p for p in secondary_preds}
 
     combined: List[MultiTimeframePrediction] = []
@@ -81,17 +157,14 @@ def combine_timeframes(
         if sec is None:
             continue
 
-        # Weighted probability combination
-        prob_up = primary_weight * pri.prob_up + secondary_weight * sec.prob_up
-        prob_flat = primary_weight * pri.prob_flat + secondary_weight * sec.prob_flat
-        prob_down = primary_weight * pri.prob_down + secondary_weight * sec.prob_down
+        # Log-odds probability combination (statistically sound)
+        p1 = np.array([pri.prob_up, pri.prob_flat, pri.prob_down])
+        p2 = np.array([sec.prob_up, sec.prob_flat, sec.prob_down])
+        combined_p = _combine_probs_log_odds(p1, p2, primary_weight, secondary_weight)
 
-        # Normalize to sum to 1
-        total = prob_up + prob_flat + prob_down
-        if total > 0:
-            prob_up /= total
-            prob_flat /= total
-            prob_down /= total
+        prob_up = float(combined_p[0])
+        prob_flat = float(combined_p[1])
+        prob_down = float(combined_p[2])
 
         # Combined magnitude (weighted average)
         magnitude = primary_weight * pri.magnitude + secondary_weight * sec.magnitude
@@ -103,11 +176,10 @@ def combine_timeframes(
         probs = {"UP": prob_up, "FLAT": prob_flat, "DOWN": prob_down}
         direction = max(probs, key=probs.get)  # type: ignore[arg-type]
 
-        # Agreement classification
+        # Agreement classification (magnitude-aware)
         agreement, agreement_label = _classify_agreement(pri, sec, direction)
 
         # Combined signal score
-        # Boost score when timeframes agree, penalize when they conflict
         agreement_multiplier = {"STRONG": 1.5, "PARTIAL": 1.0, "CONFLICT": 0.3}
         directional_prob = max(prob_up, prob_down)
 
@@ -152,10 +224,20 @@ def combine_timeframes(
     return combined
 
 
+# Magnitude below which a secondary disagreement is a pullback, not a conflict
+_PULLBACK_MAG_THRESHOLD = 0.01  # 1%
+
+
 def _classify_agreement(
     pri: Prediction, sec: Prediction, combined_dir: str
 ) -> tuple[str, str]:
-    """Classify whether the two timeframes agree on direction."""
+    """
+    Classify whether the two timeframes agree on direction.
+
+    Uses magnitude-aware logic: if the primary says UP but the secondary says
+    DOWN with a tiny magnitude (<1%), it's a pullback within the trend, not a
+    genuine conflict.
+    """
     pri_dir = pri.direction
     sec_dir = sec.direction
 
@@ -168,8 +250,19 @@ def _classify_agreement(
     elif pri_dir == "FLAT" and sec_dir != "FLAT":
         return "PARTIAL", f"TIMING {sec_dir}"
     else:
-        # Both directional but opposite
-        return "CONFLICT", "CONFLICT"
+        # Both directional but opposite — check magnitudes
+        sec_mag_small = abs(sec.magnitude) < _PULLBACK_MAG_THRESHOLD
+        pri_mag_small = abs(pri.magnitude) < _PULLBACK_MAG_THRESHOLD
+
+        if sec_mag_small and not pri_mag_small:
+            # Secondary disagrees but with tiny magnitude = pullback in trend
+            return "PARTIAL", f"PULLBACK {pri_dir}"
+        elif pri_mag_small and not sec_mag_small:
+            # Primary is weak, secondary has conviction
+            return "PARTIAL", f"TIMING {sec_dir}"
+        else:
+            # Both have significant magnitude in opposite directions
+            return "CONFLICT", "CONFLICT"
 
 
 def format_multi_timeframe_message(

@@ -89,14 +89,15 @@ async def score_predictions(
         pred_ts = row["ts"]
         pred_direction = row["direction"]
         pred_id = int(row["id"])
+        interval = row.get("interval", "60")
 
-        # Get the close price at prediction time
-        pred_close = await storage.get_close_at_ts(symbol, pred_ts)
+        # Get the close price at prediction time (same interval)
+        pred_close = await storage.get_close_at_ts(symbol, pred_ts, interval=interval)
         if pred_close is None or pred_close == 0:
             continue
 
-        # Get the next candle after prediction time
-        next_candle = await storage.get_next_candle_close(symbol, pred_ts)
+        # Get the next candle after prediction time (same interval)
+        next_candle = await storage.get_next_candle_close(symbol, pred_ts, interval=interval)
         if next_candle is None:
             continue
 
@@ -140,9 +141,6 @@ async def compute_accuracy_report(
         flat_threshold_used=flat_threshold,
     )
 
-    # Overall direction accuracy
-    report.direction_accuracy = float(df["was_correct"].mean())
-
     # Magnitude MAE
     df["magnitude"] = pd.to_numeric(df["magnitude"], errors="coerce")
     df["actual_magnitude"] = pd.to_numeric(df["actual_magnitude"], errors="coerce")
@@ -152,17 +150,35 @@ async def compute_accuracy_report(
             (valid_mag["magnitude"] - valid_mag["actual_magnitude"]).abs().mean()
         )
 
+    # Re-classify actual_direction using the CURRENT flat_threshold so that
+    # metrics are consistent even if the threshold was different at scoring time.
+    df["actual_dir_now"] = df["actual_magnitude"].apply(
+        lambda m: classify_direction(float(m), flat_threshold)
+        if pd.notna(m) else None
+    )
+    df["correct_now"] = df["direction"] == df["actual_dir_now"]
+
+    valid = df.dropna(subset=["actual_dir_now"])
+
+    # Overall direction accuracy (re-evaluated against current threshold)
+    if not valid.empty:
+        report.direction_accuracy = float(valid["correct_now"].mean())
+    else:
+        report.direction_accuracy = 0.0
+
     # Per-class precision and recall
     for label, attr_prec, attr_rec in [
         ("UP", "up_precision", "up_recall"),
         ("DOWN", "down_precision", "down_recall"),
         ("FLAT", "flat_precision", "flat_recall"),
     ]:
-        predicted_as = df[df["direction"] == label]
-        actually_is = df[df["actual_direction"] == label]
+        predicted_as = valid[valid["direction"] == label]
+        actually_is = valid[valid["actual_dir_now"] == label]
 
         if len(predicted_as) > 0:
-            precision = float(predicted_as["was_correct"].mean())
+            precision = float(
+                (predicted_as["actual_dir_now"] == label).sum() / len(predicted_as)
+            )
         else:
             precision = 0.0
 

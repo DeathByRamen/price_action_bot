@@ -12,9 +12,11 @@ Supports:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
-from typing import Dict, Optional
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -93,9 +95,16 @@ class Trainer:
         val_ds: CryptoTimeSeriesDataset,
         tag: str = "fold",
         use_sample_weights: bool = False,
+        periodic_checkpoint_every: int = 10,
     ) -> Dict[str, list]:
         """
         Train the model on *train_ds* and evaluate on *val_ds*.
+
+        Parameters
+        ----------
+        periodic_checkpoint_every : int
+            Save a periodic checkpoint every N epochs (in addition to best).
+            Set to 0 to disable.
 
         Returns a dict of training history: {train_loss, val_loss, val_acc, ...}
         """
@@ -123,6 +132,7 @@ class Trainer:
         best_val_loss = float("inf")
         epochs_no_improve = 0
         best_path = os.path.join(self.checkpoint_dir, f"best_{tag}.pt")
+        periodic_path = os.path.join(self.checkpoint_dir, f"periodic_{tag}.pt")
 
         for epoch in range(1, self.max_epochs + 1):
             train_loss = self._train_epoch(train_loader)
@@ -158,10 +168,19 @@ class Trainer:
                     logger.info("[%s] Early stopping at epoch %d", tag, epoch)
                     break
 
+            # Periodic checkpoint for crash recovery
+            if periodic_checkpoint_every > 0 and epoch % periodic_checkpoint_every == 0:
+                torch.save(self.model.state_dict(), periodic_path)
+                logger.info("[%s] Periodic checkpoint saved at epoch %d", tag, epoch)
+
         # Reload best checkpoint
         if os.path.exists(best_path):
             self.model.load_state_dict(torch.load(best_path, weights_only=True))
             logger.info("[%s] Reloaded best checkpoint", tag)
+
+        # Clean up periodic checkpoint
+        if os.path.exists(periodic_path):
+            os.remove(periodic_path)
 
         return history
 
@@ -274,9 +293,14 @@ class Trainer:
             "reg_mae": float(np.mean(abs_errors)) if abs_errors else 0.0,
         }
 
-    def save_final(self, path: Optional[str] = None, tag: Optional[str] = None) -> str:
+    def save_final(
+        self,
+        path: Optional[str] = None,
+        tag: Optional[str] = None,
+        feature_cols: Optional[List[str]] = None,
+    ) -> str:
         """
-        Save the current model weights (including calibrated temperature).
+        Save the current model weights with metadata for version verification.
 
         Parameters
         ----------
@@ -285,18 +309,64 @@ class Trainer:
         tag : str | None
             If set, saves as ``model_{tag}.pt`` (e.g. ``model_final_60.pt``
             for the 1h model). Ignored when *path* is provided.
+        feature_cols : list[str] | None
+            Feature column names used during training. Saved as a hash for
+            mismatch detection at load time.
         """
         if path is None:
             filename = f"model_{tag}.pt" if tag else "model_final.pt"
             path = os.path.join(self.checkpoint_dir, filename)
-        torch.save(self.model.state_dict(), path)
-        logger.info("Model saved to %s", path)
+
+        cols_hash = ""
+        if feature_cols:
+            cols_hash = hashlib.md5(",".join(feature_cols).encode()).hexdigest()
+
+        checkpoint = {
+            "model_state_dict": self.model.state_dict(),
+            "num_features": self.model.num_features,
+            "hidden_dim": self.model.hidden_dim,
+            "feature_cols_hash": cols_hash,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        torch.save(checkpoint, path)
+        logger.info("Model saved to %s (num_features=%d, hidden=%d)",
+                     path, self.model.num_features, self.model.hidden_dim)
         return path
 
+    def evaluate(self, dataset: CryptoTimeSeriesDataset) -> Dict[str, float]:
+        """
+        Evaluate the current model on a dataset and return metrics.
+
+        Returns dict with keys: loss, cls_acc, reg_mae.
+        """
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
+        return self._validate_epoch(loader)
+
     def load(self, path: str) -> None:
-        """Load model weights from checkpoint."""
-        self.model.load_state_dict(
-            torch.load(path, map_location=self.device, weights_only=True)
-        )
+        """Load model weights from checkpoint, verifying metadata if present."""
+        data = torch.load(path, map_location=self.device, weights_only=False)
+
+        if isinstance(data, dict) and "model_state_dict" in data:
+            ckpt_feats = data.get("num_features")
+            ckpt_hidden = data.get("hidden_dim")
+            if ckpt_feats and ckpt_feats != self.model.num_features:
+                raise RuntimeError(
+                    f"Checkpoint expects {ckpt_feats} features but model "
+                    f"has {self.model.num_features}. Retrain required."
+                )
+            if ckpt_hidden and ckpt_hidden != self.model.hidden_dim:
+                raise RuntimeError(
+                    f"Checkpoint expects hidden_dim={ckpt_hidden} but model "
+                    f"has {self.model.hidden_dim}. Config mismatch."
+                )
+            self.model.load_state_dict(data["model_state_dict"])
+            logger.info(
+                "Model loaded from %s (created=%s)",
+                path, data.get("created_at", "unknown"),
+            )
+        else:
+            # Legacy checkpoint: plain state_dict
+            self.model.load_state_dict(data)
+            logger.info("Model loaded from %s (legacy format)", path)
+
         self.model.eval()
-        logger.info("Model loaded from %s", path)
