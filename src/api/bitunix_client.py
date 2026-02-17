@@ -128,10 +128,12 @@ class BitunixClient:
                     resp.raise_for_status()
                     data = await resp.json()
 
-                    if data.get("code") != 0:
+                    # BitUnix returns code as string "0" for success
+                    code = data.get("code")
+                    if str(code) != "0":
                         logger.error(
                             "API error code=%s msg=%s url=%s",
-                            data.get("code"),
+                            code,
                             data.get("msg"),
                             url,
                         )
@@ -224,7 +226,7 @@ class BitunixClient:
         """
         url = f"{SPOT_BASE}/api/spot/v1/market/kline/history"
         params: Dict[str, str] = {
-            "symbol": symbol,
+            "symbol": symbol.lower(),
             "interval": interval,
             "limit": str(min(limit, 500)),
         }
@@ -260,7 +262,7 @@ class BitunixClient:
         Returns the single most-recent candle for the given pair / interval.
         """
         url = f"{SPOT_BASE}/api/spot/v1/market/kline"
-        params = {"symbol": symbol, "interval": interval}
+        params = {"symbol": symbol.lower(), "interval": interval}
         data = await self._request("GET", url, params=params)
         item = data.get("data")
         if not item:

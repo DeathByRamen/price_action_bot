@@ -33,6 +33,28 @@ class DataCollector:
         logger.info("Discovered %d futures symbols", len(symbols))
         return sorted(symbols)
 
+    async def discover_tradeable_symbols(self) -> List[str]:
+        """
+        Return futures symbols that also have a spot pair
+        (needed because kline history comes from the spot API).
+        """
+        futures = await self.discover_futures_symbols()
+        spot_pairs = await self.client.get_coin_pairs()
+        spot_set = {
+            p.get("symbol", "").lower()
+            for p in spot_pairs
+            if p.get("isOpen") == 1
+        }
+        valid = [s for s in futures if s.lower() in spot_set]
+        skipped = len(futures) - len(valid)
+        if skipped:
+            logger.info(
+                "%d futures symbols have no spot pair (skipped for kline data)",
+                skipped,
+            )
+        logger.info("Using %d symbols with both futures + spot data", len(valid))
+        return valid
+
     # ------------------------------------------------------------------
     # Incremental fetch (hourly run)
     # ------------------------------------------------------------------

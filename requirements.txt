@@ -1,7 +1,12 @@
 # PA Bot - Python Dependencies
-# Install: pip install -r requirements.txt
+#
+# Install (CPU — works everywhere):
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+#
+# Install (GPU — requires NVIDIA CUDA 12.1+):
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121
 
-# Deep Learning
+# Deep Learning (CPU by default; see install commands above for GPU)
 torch>=2.0
 
 # Data & Analysis

@@ -16,6 +16,9 @@ import os
 from typing import Dict, List, Optional, Union
 
 import yaml
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from src.api.bitunix_client import BitunixClient
 from src.data.collector import DataCollector
@@ -39,32 +42,37 @@ def build_dispatcher(config: Dict) -> Dispatcher:
     dispatcher = Dispatcher()
     notif_cfg = config.get("notifications", {})
 
-    # Discord
+    # Discord — config or env var
     discord_cfg = notif_cfg.get("discord", {})
-    if discord_cfg.get("enabled") and discord_cfg.get("webhook_url"):
-        dispatcher.register(DiscordNotifier(webhook_url=discord_cfg["webhook_url"]))
+    discord_url = discord_cfg.get("webhook_url") or os.getenv("DISCORD_WEBHOOK_URL", "")
+    if discord_cfg.get("enabled") and discord_url:
+        dispatcher.register(DiscordNotifier(webhook_url=discord_url))
 
-    # Telegram
+    # Telegram — config or env vars
     telegram_cfg = notif_cfg.get("telegram", {})
-    if telegram_cfg.get("enabled") and telegram_cfg.get("bot_token") and telegram_cfg.get("chat_id"):
-        dispatcher.register(
-            TelegramNotifier(
-                bot_token=telegram_cfg["bot_token"],
-                chat_id=telegram_cfg["chat_id"],
-            )
-        )
+    tg_token = telegram_cfg.get("bot_token") or os.getenv("TELEGRAM_BOT_TOKEN", "")
+    tg_chat = telegram_cfg.get("chat_id") or os.getenv("TELEGRAM_CHAT_ID", "")
+    if telegram_cfg.get("enabled") and tg_token and tg_chat:
+        dispatcher.register(TelegramNotifier(bot_token=tg_token, chat_id=tg_chat))
 
-    # Email
+    # Email — config or env vars
     email_cfg = notif_cfg.get("email", {})
-    if email_cfg.get("enabled") and email_cfg.get("smtp_host"):
+    smtp_password = email_cfg.get("password") or os.getenv("SMTP_PASSWORD", "")
+    smtp_username = email_cfg.get("username") or os.getenv("SMTP_USERNAME", "")
+    smtp_host = email_cfg.get("smtp_host") or os.getenv("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = email_cfg.get("smtp_port") or int(os.getenv("SMTP_PORT", "587"))
+    from_addr = email_cfg.get("from_addr") or os.getenv("EMAIL_FROM", "")
+    to_addrs = email_cfg.get("to_addrs") or os.getenv("EMAIL_TO", "").split(",")
+
+    if email_cfg.get("enabled") and smtp_host and smtp_password:
         dispatcher.register(
             EmailNotifier(
-                smtp_host=email_cfg["smtp_host"],
-                smtp_port=email_cfg.get("smtp_port", 587),
-                username=email_cfg["username"],
-                password=email_cfg["password"],
-                from_addr=email_cfg["from_addr"],
-                to_addrs=email_cfg["to_addrs"],
+                smtp_host=smtp_host,
+                smtp_port=smtp_port,
+                username=smtp_username,
+                password=smtp_password,
+                from_addr=from_addr,
+                to_addrs=[a.strip() for a in to_addrs if a.strip()],
                 use_tls=email_cfg.get("use_tls", True),
             )
         )
@@ -119,7 +127,7 @@ async def run_pipeline(
         collector = DataCollector(client, storage)
 
         # 2. Discover symbols
-        symbols = await collector.discover_futures_symbols()
+        symbols = await collector.discover_tradeable_symbols()
         logger.info("Pipeline [%sm]: processing %d symbols", interval, len(symbols))
 
         # 3. Fetch latest candles (gap-fill)

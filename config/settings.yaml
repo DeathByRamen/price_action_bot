@@ -43,15 +43,15 @@ notifications:
     chat_id: ""           # your chat/group ID
 
   email:
-    enabled: false
+    enabled: true
     smtp_host: "smtp.gmail.com"
     smtp_port: 587
     use_tls: true
-    username: ""
-    password: ""          # app-specific password recommended
-    from_addr: ""
+    username: "seanmcgill714@gmail.com"
+    password: ""
+    from_addr: "seanmcgill714@gmail.com"
     to_addrs:
-      - ""
+      - "seanmcgill714@gmail.com"
 
 # ---------------------------------------------------------------
 # Data storage

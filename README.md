@@ -90,7 +90,12 @@ pa_bot/
 
 ```bash
 cd pa_bot
-pip install -r requirements.txt
+
+# CPU (works everywhere, recommended for most setups)
+pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+
+# GPU (only if you have NVIDIA + CUDA 12.1+)
+# pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121
 ```
 
 ### 2. Configure

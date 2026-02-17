@@ -62,7 +62,7 @@ async def gap_fill(db_path: str | None, intervals: list[str] | None = None) -> i
     total = 0
     async with BitunixClient() as client, Storage(db_path) as storage:
         collector = DataCollector(client, storage)
-        symbols = await collector.discover_futures_symbols()
+        symbols = await collector.discover_tradeable_symbols()
         for interval in intervals:
             # Scale lookback by interval: 48h worth of candles
             interval_mins = int(interval) if interval.isdigit() else 60
