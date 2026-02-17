@@ -1,14 +1,18 @@
 """
 Inference engine: loads a trained model checkpoint and generates predictions
 for all symbols from their latest feature windows.
+
+Uses calibrated temperature for well-calibrated probabilities and
+entropy-based conviction scoring for signal ranking.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import os
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -29,13 +33,16 @@ DEFAULT_MODEL_PATH = os.path.join(
 @dataclass
 class Prediction:
     symbol: str
-    direction: str  # "UP", "FLAT", "DOWN"
+    direction: str            # "UP", "FLAT", "DOWN"
     prob_up: float
     prob_flat: float
     prob_down: float
-    magnitude: float  # predicted % change
-    signal_score: float  # |max_directional_prob - 0.33| * |magnitude|
+    magnitude: float          # predicted % change
+    signal_score: float       # entropy-weighted conviction * directional prob * magnitude
+    conviction: float         # 1 - normalized_entropy (0 = random, 1 = certain)
     current_price: float
+    feature_attention: Optional[Dict[str, float]] = field(default=None, repr=False)
+    temporal_attention: Optional[np.ndarray] = field(default=None, repr=False)
 
 
 class Predictor:
@@ -71,25 +78,29 @@ class Predictor:
             self.model.load_state_dict(
                 torch.load(path, map_location=self.device, weights_only=True)
             )
-            logger.info("Loaded model from %s", path)
+            logger.info("Loaded model from %s (temperature=%.4f)",
+                        path, self.model.temperature.item())
         else:
             logger.warning("No model checkpoint at %s -- predictions will be random!", path)
 
         self.model.eval()
 
-    def predict_symbol(self, df: pd.DataFrame, symbol: str) -> Optional[Prediction]:
+    def predict_symbol(
+        self,
+        df: pd.DataFrame,
+        symbol: str,
+        return_attention: bool = False,
+    ) -> Optional[Prediction]:
         """
         Generate a prediction for a single symbol given its OHLCV DataFrame.
 
-        The DataFrame must have at least `window_size + 50` rows (50 for indicator
-        warm-up) and columns: open, high, low, close, volume.
+        The DataFrame must have at least ``window_size + 50`` rows (50 for
+        indicator warm-up) and columns: open, high, low, close, volume.
         """
         if len(df) < self.window_size + 50:
             logger.debug(
                 "%s: insufficient data (%d rows, need %d)",
-                symbol,
-                len(df),
-                self.window_size + 50,
+                symbol, len(df), self.window_size + 50,
             )
             return None
 
@@ -101,33 +112,50 @@ class Predictor:
             logger.debug("%s: insufficient data after indicator NaN drop", symbol)
             return None
 
-        # Z-score normalize the feature window
+        # Extract and normalize the feature window
         feature_data = df[self.feature_cols].values.astype(np.float32)
         window = feature_data[-self.window_size:]
 
-        # Per-window normalization (same approach used during training)
+        # Per-window Z-score normalization (matches training exactly)
         means = np.nanmean(window, axis=0, keepdims=True)
         stds = np.nanstd(window, axis=0, keepdims=True)
         stds[stds == 0] = 1.0
         window = (window - means) / stds
-
-        # Replace any remaining NaN/inf
         window = np.nan_to_num(window, nan=0.0, posinf=0.0, neginf=0.0)
 
         x = torch.from_numpy(window).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
-            cls_logits, mag_pred = self.model(x)
-            probs = torch.softmax(cls_logits, dim=1).squeeze(0).cpu().numpy()
+            if return_attention:
+                cls_logits, mag_pred, feat_w, temp_w = self.model(
+                    x, return_attention=True
+                )
+            else:
+                cls_logits, mag_pred = self.model(x)
+                feat_w = temp_w = None
+
+            # Apply calibrated temperature for well-calibrated probabilities
+            temperature = self.model.temperature.clamp(min=0.01)
+            scaled_logits = cls_logits / temperature
+            probs = torch.softmax(scaled_logits, dim=1).squeeze(0).cpu().numpy()
             magnitude = mag_pred.squeeze().cpu().item()
 
         direction_idx = int(np.argmax(probs))
         direction = DIRECTION_LABELS[direction_idx]
 
-        max_prob = float(probs[direction_idx])
-        signal_score = abs(max_prob - 1.0 / 3.0) * abs(magnitude)
+        # Entropy-based conviction scoring
+        conviction, signal_score = _compute_signal_score(probs, magnitude)
 
         current_price = float(df["close"].iloc[-1])
+
+        # Attention weights (optional, for interpretability)
+        feat_attention = None
+        temp_attention = None
+        if feat_w is not None:
+            avg_feat = feat_w.squeeze(0).mean(dim=0).cpu().numpy()
+            feat_attention = dict(zip(self.feature_cols, avg_feat.tolist()))
+        if temp_w is not None:
+            temp_attention = temp_w.squeeze(0).cpu().numpy()
 
         return Prediction(
             symbol=symbol,
@@ -137,9 +165,41 @@ class Predictor:
             prob_down=float(probs[2]),
             magnitude=magnitude,
             signal_score=signal_score,
+            conviction=conviction,
             current_price=current_price,
+            feature_attention=feat_attention,
+            temporal_attention=temp_attention,
         )
 
     def rank_predictions(self, predictions: List[Prediction]) -> List[Prediction]:
         """Sort predictions by signal_score descending (strongest conviction first)."""
         return sorted(predictions, key=lambda p: p.signal_score, reverse=True)
+
+
+def _compute_signal_score(
+    probs: np.ndarray,
+    magnitude: float,
+) -> tuple[float, float]:
+    """
+    Compute conviction and signal score from probability distribution.
+
+    Conviction is based on Shannon entropy:
+      conviction = 1 - H(p) / H_max
+    where H_max = log(3) for 3 classes.
+
+    Signal score combines conviction, directional probability, and magnitude:
+      score = conviction * max(prob_up, prob_down) * |magnitude|
+
+    This replaces the old ad-hoc ``|max_prob - 0.33| * |magnitude|`` formula
+    which gave near-zero scores for marginal directional leans.
+    """
+    eps = 1e-10
+    entropy = -float(np.sum(probs * np.log(probs + eps)))
+    max_entropy = math.log(3)
+
+    conviction = max(0.0, 1.0 - (entropy / max_entropy))
+
+    directional_prob = max(float(probs[0]), float(probs[2]))  # max of UP, DOWN
+    signal_score = conviction * directional_prob * abs(magnitude)
+
+    return conviction, signal_score

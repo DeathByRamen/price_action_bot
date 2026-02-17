@@ -3,23 +3,25 @@ Training loop for the CryptoPredictorLSTM model.
 
 Supports:
   - Single-fold or walk-forward cross-validation training
+  - Automatic class-weight balancing for imbalanced labels
   - Automatic checkpointing of best model
   - Early stopping
   - Learning rate scheduling
+  - Post-training temperature calibration for probability calibration
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader
 
 from .architecture import CryptoPredictorLSTM, PredictionLoss
 from .dataset import CryptoTimeSeriesDataset
@@ -41,7 +43,7 @@ class Trainer:
         num_layers: int = 2,
         dropout: float = 0.3,
         lr: float = 1e-3,
-        weight_decay: float = 1e-5,
+        weight_decay: float = 1e-4,
         lambda_cls: float = 1.0,
         lambda_reg: float = 1.0,
         batch_size: int = 64,
@@ -49,6 +51,7 @@ class Trainer:
         patience: int = 10,
         checkpoint_dir: Optional[str] = None,
         device: Optional[str] = None,
+        class_weights: Optional[torch.Tensor] = None,
     ):
         self.batch_size = batch_size
         self.max_epochs = max_epochs
@@ -68,8 +71,14 @@ class Trainer:
             dropout=dropout,
         ).to(self.device)
 
+        # Move class weights to device if provided
+        if class_weights is not None:
+            class_weights = class_weights.to(self.device)
+
         self.criterion = PredictionLoss(
-            lambda_cls=lambda_cls, lambda_reg=lambda_reg
+            lambda_cls=lambda_cls,
+            lambda_reg=lambda_reg,
+            class_weights=class_weights,
         )
         self.optimizer = AdamW(
             self.model.parameters(), lr=lr, weight_decay=weight_decay
@@ -87,12 +96,6 @@ class Trainer:
     ) -> Dict[str, list]:
         """
         Train the model on *train_ds* and evaluate on *val_ds*.
-
-        Parameters
-        ----------
-        use_sample_weights : bool
-            If True, uses the dataset's per-sample weights via
-            WeightedRandomSampler instead of uniform shuffle.
 
         Returns a dict of training history: {train_loss, val_loss, val_acc, ...}
         """
@@ -162,6 +165,60 @@ class Trainer:
 
         return history
 
+    def calibrate_temperature(self, val_ds: CryptoTimeSeriesDataset) -> float:
+        """
+        Calibrate the model's temperature parameter on validation data.
+
+        Freezes all model weights except ``temperature`` and optimizes it
+        to minimize Negative Log-Likelihood on the validation set.  This
+        ensures softmax probabilities are well-calibrated (i.e. "70% UP"
+        actually corresponds to ~70% observed frequency).
+
+        Returns the calibrated temperature value.
+        """
+        self.model.eval()
+        loader = DataLoader(val_ds, batch_size=self.batch_size, shuffle=False)
+
+        # Collect all logits and labels
+        all_logits = []
+        all_labels = []
+        with torch.no_grad():
+            for x, y_dir, _y_mag in loader:
+                x = x.to(self.device)
+                cls_logits, _ = self.model(x)
+                all_logits.append(cls_logits)
+                all_labels.append(y_dir.to(self.device))
+
+        all_logits = torch.cat(all_logits, dim=0)
+        all_labels = torch.cat(all_labels, dim=0)
+
+        # Freeze everything except temperature
+        for param in self.model.parameters():
+            param.requires_grad = False
+        self.model.temperature.requires_grad = True
+
+        nll = nn.CrossEntropyLoss()
+        optimizer = torch.optim.LBFGS(
+            [self.model.temperature], lr=0.01, max_iter=50
+        )
+
+        def _closure():
+            optimizer.zero_grad()
+            scaled = all_logits / self.model.temperature.clamp(min=0.01)
+            loss = nll(scaled, all_labels)
+            loss.backward()
+            return loss
+
+        optimizer.step(_closure)
+
+        # Restore requires_grad
+        for param in self.model.parameters():
+            param.requires_grad = True
+
+        temp = self.model.temperature.item()
+        logger.info("Temperature calibrated to %.4f", temp)
+        return temp
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -218,7 +275,7 @@ class Trainer:
         }
 
     def save_final(self, path: Optional[str] = None) -> str:
-        """Save the current model weights."""
+        """Save the current model weights (including calibrated temperature)."""
         path = path or os.path.join(self.checkpoint_dir, "model_final.pt")
         torch.save(self.model.state_dict(), path)
         logger.info("Model saved to %s", path)

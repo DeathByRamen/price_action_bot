@@ -1,11 +1,12 @@
 """
-Technical indicator feature engineering.
+Technical indicator feature engineering (quant-grade).
+
+All features are price-relative or bounded — no raw price/volume values
+that would differ by orders of magnitude across symbols.
 
 Accepts a DataFrame with columns [open, high, low, close, volume]
-and returns the same frame augmented with ~30 indicator columns ready
+and returns the same frame augmented with indicator columns ready
 for model consumption.
-
-Uses the `ta` library where convenient and raw pandas/numpy otherwise.
 """
 
 from __future__ import annotations
@@ -14,7 +15,6 @@ import logging
 
 import numpy as np
 import pandas as pd
-import ta
 from ta.momentum import RSIIndicator, StochRSIIndicator, WilliamsRIndicator, ROCIndicator
 from ta.trend import MACD, EMAIndicator, ADXIndicator
 from ta.volatility import BollingerBands, AverageTrueRange, KeltnerChannel
@@ -27,9 +27,13 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     Add all technical indicator columns to *df* **in place** and return it.
 
-    Expects columns: open, high, low, close, volume.
-    The first ~50 rows will have NaN in some indicator columns due to
-    lookback requirements; callers should either drop or forward-fill them.
+    Every feature is either:
+      - A bounded oscillator (0-100, 0-1, etc.)
+      - A ratio or percentage
+      - Normalized by ATR or close price
+
+    This ensures features are comparable across symbols with vastly
+    different price levels (e.g. BTC at $60k vs an altcoin at $0.003).
     """
     c = df["close"]
     h = df["high"]
@@ -37,56 +41,68 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     o = df["open"]
     v = df["volume"]
 
-    # ----------------------------------------------------------------
-    # Trend indicators
-    # ----------------------------------------------------------------
-    df["ema_9"] = EMAIndicator(c, window=9).ema_indicator()
-    df["ema_21"] = EMAIndicator(c, window=21).ema_indicator()
-    df["ema_50"] = EMAIndicator(c, window=50).ema_indicator()
-
-    macd = MACD(c, window_slow=26, window_fast=12, window_sign=9)
-    df["macd"] = macd.macd()
-    df["macd_signal"] = macd.macd_signal()
-    df["macd_hist"] = macd.macd_diff()
-
-    adx = ADXIndicator(h, l, c, window=14)
-    df["adx"] = adx.adx()
-    df["adx_pos"] = adx.adx_pos()
-    df["adx_neg"] = adx.adx_neg()
+    # Compute ATR first — used to normalize price-distance features
+    atr_raw = AverageTrueRange(h, l, c, window=14).average_true_range()
+    atr_safe = atr_raw.replace(0, np.nan)
+    c_safe = c.replace(0, np.nan)
 
     # ----------------------------------------------------------------
-    # Momentum indicators
+    # Trend indicators (price-relative distances)
     # ----------------------------------------------------------------
-    df["rsi_14"] = RSIIndicator(c, window=14).rsi()
+    ema_9 = EMAIndicator(c, window=9).ema_indicator()
+    ema_21 = EMAIndicator(c, window=21).ema_indicator()
+    ema_50 = EMAIndicator(c, window=50).ema_indicator()
+
+    # Distance from EMA in ATR units (scale-invariant)
+    df["ema_9_dist"] = (c - ema_9) / atr_safe
+    df["ema_21_dist"] = (c - ema_21) / atr_safe
+    df["ema_50_dist"] = (c - ema_50) / atr_safe
+
+    macd_obj = MACD(c, window_slow=26, window_fast=12, window_sign=9)
+    # Normalize MACD by close price so it's a percentage
+    df["macd_norm"] = macd_obj.macd() / c_safe
+    df["macd_signal_norm"] = macd_obj.macd_signal() / c_safe
+    df["macd_hist_norm"] = macd_obj.macd_diff() / c_safe
+
+    adx_obj = ADXIndicator(h, l, c, window=14)
+    df["adx"] = adx_obj.adx()          # 0–100 bounded
+    df["adx_pos"] = adx_obj.adx_pos()  # 0–100 bounded
+    df["adx_neg"] = adx_obj.adx_neg()  # 0–100 bounded
+
+    # ----------------------------------------------------------------
+    # Momentum indicators (already bounded / relative)
+    # ----------------------------------------------------------------
+    df["rsi_14"] = RSIIndicator(c, window=14).rsi()  # 0–100
 
     stoch_rsi = StochRSIIndicator(c, window=14, smooth1=3, smooth2=3)
-    df["stoch_rsi_k"] = stoch_rsi.stochrsi_k()
-    df["stoch_rsi_d"] = stoch_rsi.stochrsi_d()
+    df["stoch_rsi_k"] = stoch_rsi.stochrsi_k()  # 0–1
+    df["stoch_rsi_d"] = stoch_rsi.stochrsi_d()  # 0–1
 
-    df["williams_r"] = WilliamsRIndicator(h, l, c, lbp=14).williams_r()
-    df["roc_12"] = ROCIndicator(c, window=12).roc()
+    df["williams_r"] = WilliamsRIndicator(h, l, c, lbp=14).williams_r()  # -100–0
+    df["roc_12"] = ROCIndicator(c, window=12).roc()  # percentage
 
     # ----------------------------------------------------------------
-    # Volatility indicators
+    # Volatility indicators (price-relative)
     # ----------------------------------------------------------------
     bb = BollingerBands(c, window=20, window_dev=2)
-    df["bb_upper"] = bb.bollinger_hband()
-    df["bb_middle"] = bb.bollinger_mavg()
-    df["bb_lower"] = bb.bollinger_lband()
-    df["bb_width"] = bb.bollinger_wband()
-    df["bb_pct"] = bb.bollinger_pband()
-
-    df["atr_14"] = AverageTrueRange(h, l, c, window=14).average_true_range()
+    df["bb_width"] = bb.bollinger_wband()   # already relative (bandwidth)
+    df["bb_pct"] = bb.bollinger_pband()     # already relative (%B)
+    df["atr_pct"] = atr_raw / c_safe        # ATR as fraction of price
 
     kc = KeltnerChannel(h, l, c, window=20, window_atr=10)
-    df["kc_upper"] = kc.keltner_channel_hband()
-    df["kc_lower"] = kc.keltner_channel_lband()
+    kc_upper = kc.keltner_channel_hband()
+    kc_lower = kc.keltner_channel_lband()
+    df["kc_width"] = (kc_upper - kc_lower) / c_safe  # channel width as % of price
+    df["kc_dist"] = (c - (kc_upper + kc_lower) / 2) / atr_safe  # distance from midline
 
     # ----------------------------------------------------------------
-    # Volume indicators
+    # Volume indicators (rate-of-change / relative)
     # ----------------------------------------------------------------
-    df["obv"] = OnBalanceVolumeIndicator(c, v).on_balance_volume()
-    df["acc_dist"] = AccDistIndexIndicator(h, l, c, v).acc_dist_index()
+    obv = OnBalanceVolumeIndicator(c, v).on_balance_volume()
+    df["obv_roc"] = obv.pct_change(5).replace([np.inf, -np.inf], np.nan)
+
+    acc_dist = AccDistIndexIndicator(h, l, c, v).acc_dist_index()
+    df["acc_dist_roc"] = acc_dist.pct_change(5).replace([np.inf, -np.inf], np.nan)
 
     vol_sma_20 = v.rolling(window=20).mean()
     df["vol_sma_ratio"] = v / vol_sma_20.replace(0, np.nan)
@@ -94,14 +110,14 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     vol_std = v.rolling(window=20).std()
     df["vol_z_score"] = (v - vol_sma_20) / vol_std.replace(0, np.nan)
 
-    # VWAP approximation (cumulative within the available window)
+    # VWAP — rolling 24-hour window (resets daily, not cumulative)
     typical = (h + l + c) / 3.0
-    cum_tp_vol = (typical * v).cumsum()
-    cum_vol = v.cumsum()
-    df["vwap"] = cum_tp_vol / cum_vol.replace(0, np.nan)
+    tp_vol = typical * v
+    vwap_24 = tp_vol.rolling(24, min_periods=1).sum() / v.rolling(24, min_periods=1).sum().replace(0, np.nan)
+    df["vwap_dist"] = (c - vwap_24) / atr_safe  # distance from VWAP in ATR units
 
     # ----------------------------------------------------------------
-    # Custom / derived features
+    # Custom / derived features (all ratios or percentages)
     # ----------------------------------------------------------------
     df["pct_change_1"] = c.pct_change(1)
     df["pct_change_4"] = c.pct_change(4)
@@ -109,17 +125,22 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     body = c - o
     candle_range = h - l
-    df["candle_body_ratio"] = body / candle_range.replace(0, np.nan)
-    df["upper_wick_ratio"] = (h - pd.concat([o, c], axis=1).max(axis=1)) / candle_range.replace(0, np.nan)
-    df["lower_wick_ratio"] = (pd.concat([o, c], axis=1).min(axis=1) - l) / candle_range.replace(0, np.nan)
+    candle_range_safe = candle_range.replace(0, np.nan)
+    df["candle_body_ratio"] = body / candle_range_safe
+    df["upper_wick_ratio"] = (
+        h - pd.concat([o, c], axis=1).max(axis=1)
+    ) / candle_range_safe
+    df["lower_wick_ratio"] = (
+        pd.concat([o, c], axis=1).min(axis=1) - l
+    ) / candle_range_safe
 
-    # EMA crossover signals (binary)
-    df["ema_9_21_cross"] = (df["ema_9"] > df["ema_21"]).astype(float)
-    df["ema_21_50_cross"] = (df["ema_21"] > df["ema_50"]).astype(float)
+    # EMA crossover signals (binary 0/1)
+    df["ema_9_21_cross"] = (ema_9 > ema_21).astype(float)
+    df["ema_21_50_cross"] = (ema_21 > ema_50).astype(float)
 
-    # Price relative to Bollinger Bands
-    df["price_vs_bb_upper"] = (c - df["bb_upper"]) / df["atr_14"].replace(0, np.nan)
-    df["price_vs_bb_lower"] = (c - df["bb_lower"]) / df["atr_14"].replace(0, np.nan)
+    # Price relative to Bollinger Bands in ATR units
+    df["price_vs_bb_upper"] = (c - bb.bollinger_hband()) / atr_safe
+    df["price_vs_bb_lower"] = (c - bb.bollinger_lband()) / atr_safe
 
     return df
 
@@ -127,19 +148,19 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 def get_feature_columns() -> list[str]:
     """Return the ordered list of indicator column names used as model features."""
     return [
-        # Trend
-        "ema_9", "ema_21", "ema_50",
-        "macd", "macd_signal", "macd_hist",
+        # Trend (price-relative)
+        "ema_9_dist", "ema_21_dist", "ema_50_dist",
+        "macd_norm", "macd_signal_norm", "macd_hist_norm",
         "adx", "adx_pos", "adx_neg",
-        # Momentum
+        # Momentum (bounded)
         "rsi_14", "stoch_rsi_k", "stoch_rsi_d",
         "williams_r", "roc_12",
-        # Volatility
-        "bb_upper", "bb_middle", "bb_lower", "bb_width", "bb_pct",
-        "atr_14", "kc_upper", "kc_lower",
-        # Volume
-        "obv", "acc_dist", "vol_sma_ratio", "vol_z_score", "vwap",
-        # Custom
+        # Volatility (price-relative)
+        "bb_width", "bb_pct", "atr_pct",
+        "kc_width", "kc_dist",
+        # Volume (rate-of-change / relative)
+        "obv_roc", "acc_dist_roc", "vol_sma_ratio", "vol_z_score", "vwap_dist",
+        # Custom (ratios / percentages)
         "pct_change_1", "pct_change_4", "pct_change_24",
         "candle_body_ratio", "upper_wick_ratio", "lower_wick_ratio",
         "ema_9_21_cross", "ema_21_50_cross",

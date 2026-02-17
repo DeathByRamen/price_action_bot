@@ -14,13 +14,16 @@ import os
 import shutil
 import sys
 from datetime import datetime, timedelta, timezone
+from typing import Dict, Optional
 
+import numpy as np
 import pandas as pd
+import torch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.data.storage import Storage
-from src.features.indicators import compute_indicators, get_feature_columns, normalize_features
+from src.features.indicators import compute_indicators, get_feature_columns
 from src.model.dataset import walk_forward_split
 from src.model.trainer import Trainer, DEFAULT_CHECKPOINT_DIR
 
@@ -29,9 +32,13 @@ async def load_training_data(
     db_path: str | None,
     min_candles: int = 200,
     rolling_days: int | None = None,
-) -> pd.DataFrame:
+) -> Dict[str, pd.DataFrame]:
     """
-    Load and concatenate candles from all symbols with enough data.
+    Load per-symbol DataFrames with computed indicators.
+
+    Returns a dict mapping symbol name to its indicator DataFrame.
+    Each symbol's data is self-contained — no cross-symbol concatenation
+    that could cause window boundary or normalization issues.
 
     Parameters
     ----------
@@ -41,44 +48,48 @@ async def load_training_data(
         Minimum candles required per symbol after indicator computation.
     rolling_days : int | None
         If set, only use the most recent N days of data per symbol.
-        This keeps the model trained on current market regimes.
     """
     max_candles_per_sym = 10_000
     if rolling_days is not None:
-        max_candles_per_sym = rolling_days * 24 + 100  # extra for indicator warm-up
+        max_candles_per_sym = rolling_days * 24 + 100
+
+    symbol_data: Dict[str, pd.DataFrame] = {}
 
     async with Storage(db_path) as storage:
         symbols = await storage.get_all_symbols()
         logging.info("Found %d symbols in database", len(symbols))
 
-        frames = []
         for sym in symbols:
             df = await storage.get_candles(sym, limit=max_candles_per_sym)
             if len(df) < min_candles:
                 logging.debug("Skipping %s: only %d candles", sym, len(df))
                 continue
 
-            # If rolling window, filter by timestamp
+            # Rolling window filter
             if rolling_days is not None and "ts" in df.columns:
                 try:
                     cutoff = datetime.now(timezone.utc) - timedelta(days=rolling_days)
                     cutoff_str = cutoff.isoformat()
                     df = df[df["ts"] >= cutoff_str].reset_index(drop=True)
                 except Exception:
-                    pass  # if timestamp parsing fails, use all data
+                    pass
 
             df = compute_indicators(df)
             df = df.dropna().reset_index(drop=True)
+
             if len(df) >= min_candles:
-                frames.append(df)
+                symbol_data[sym] = df
                 logging.info("%s: %d rows after indicators", sym, len(df))
 
-    if not frames:
+    if not symbol_data:
         raise RuntimeError("No symbols have enough data for training")
 
-    combined = pd.concat(frames, ignore_index=True)
-    logging.info("Combined training data: %d rows from %d symbols", len(combined), len(frames))
-    return combined
+    total_rows = sum(len(df) for df in symbol_data.values())
+    logging.info(
+        "Loaded training data: %d total rows from %d symbols",
+        total_rows, len(symbol_data),
+    )
+    return symbol_data
 
 
 def backup_checkpoint(checkpoint_dir: str | None = None) -> str | None:
@@ -132,29 +143,19 @@ def main() -> None:
     if args.rolling_days:
         logging.info("Rolling window: using last %d days of data per symbol", args.rolling_days)
 
-    # Back up existing checkpoint if requested
     if args.backup:
         backup_checkpoint()
 
-    # Load data
-    combined = asyncio.run(
+    # Load per-symbol data (no global concatenation)
+    symbol_data = asyncio.run(
         load_training_data(args.db, rolling_days=args.rolling_days)
     )
 
     feature_cols = get_feature_columns()
 
-    # Normalize features in-place for training
-    for col in feature_cols:
-        mean = combined[col].mean()
-        std = combined[col].std()
-        if std > 0:
-            combined[col] = (combined[col] - mean) / std
-        else:
-            combined[col] = 0.0
-
-    # Walk-forward splits
+    # Walk-forward splits (temporal, per-symbol)
     splits = walk_forward_split(
-        combined,
+        symbol_data,
         n_splits=args.folds,
         window_size=args.window,
         horizon=args.horizon,
@@ -165,13 +166,26 @@ def main() -> None:
         logging.error("No valid train/val splits. Need more data.")
         sys.exit(1)
 
-    # Train on last fold (most data) -- use earlier folds for hyperparameter insight
+    # Train on last fold (most data)
     train_ds, val_ds = splits[-1]
     logging.info(
         "Training on final fold: %d train samples, %d val samples",
-        len(train_ds),
-        len(val_ds),
+        len(train_ds), len(val_ds),
     )
+
+    # Compute inverse-frequency class weights for balanced training
+    label_counts = train_ds.get_label_counts()
+    logging.info(
+        "Label distribution: UP=%d, FLAT=%d, DOWN=%d",
+        label_counts[0], label_counts[1], label_counts[2],
+    )
+    class_weights = None
+    if label_counts.min() > 0:
+        inv_freq = 1.0 / label_counts.astype(np.float64)
+        normed = (inv_freq / inv_freq.sum()) * 3  # scale to num_classes
+        class_weights = torch.tensor(normed, dtype=torch.float32)
+        logging.info("Class weights: UP=%.3f, FLAT=%.3f, DOWN=%.3f",
+                      class_weights[0], class_weights[1], class_weights[2])
 
     trainer = Trainer(
         num_features=len(feature_cols),
@@ -182,9 +196,15 @@ def main() -> None:
         batch_size=args.batch_size,
         max_epochs=args.epochs,
         patience=args.patience,
+        class_weights=class_weights,
     )
 
     history = trainer.fit(train_ds, val_ds, tag="final")
+
+    # Calibrate temperature on validation data
+    logging.info("Calibrating probability temperature on validation set...")
+    trainer.calibrate_temperature(val_ds)
+
     final_path = trainer.save_final()
 
     logging.info("Training complete. Best model saved to: %s", final_path)

@@ -8,8 +8,10 @@ Workflow:
   3. Compute accuracy report
   4. Auto-tune FLAT_THRESHOLD and compute sample weights
   5. Back up existing model checkpoint
-  6. Retrain LSTM on rolling window with adaptive weights
-  7. Send accuracy + retrain digest via notifications
+  6. Retrain LSTM on rolling window with adaptive weights + class balancing
+  7. Calibrate probability temperature on validation set
+  8. Run permutation importance for feature auditing
+  9. Send accuracy + retrain digest via notifications
 
 Usage:
     python scripts/daily_retrain.py [--config config/settings.yaml]
@@ -25,6 +27,8 @@ import os
 import sys
 from datetime import datetime, timezone
 
+import numpy as np
+import torch
 import yaml
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -35,7 +39,7 @@ from src.data.storage import Storage
 from src.features.indicators import get_feature_columns
 from src.model.dataset import walk_forward_split, DEFAULT_FLAT_THRESHOLD
 from src.model.trainer import Trainer
-from src.notifications.dispatcher import Dispatcher
+from src.model.importance import compute_permutation_importance, format_importance_report
 from src.pipeline import build_dispatcher
 from src.scoring.accuracy import score_predictions, compute_accuracy_report, AccuracyReport
 from src.scoring.adaptive import (
@@ -84,11 +88,9 @@ async def run_scoring_and_tuning(
     )
 
     async with Storage(db_path) as storage:
-        # Score un-scored predictions
         n_scored = await score_predictions(storage, flat_threshold=current_threshold)
         logging.info("Scored %d predictions", n_scored)
 
-        # Compute accuracy report
         report = await compute_accuracy_report(
             storage, days=1, flat_threshold=current_threshold
         )
@@ -96,7 +98,6 @@ async def run_scoring_and_tuning(
         if report:
             await storage.insert_accuracy_log(report.as_db_row())
 
-        # Auto-tune threshold
         new_threshold = await compute_optimal_threshold(
             storage,
             lookback_days=lookback_days,
@@ -104,7 +105,6 @@ async def run_scoring_and_tuning(
             config=adaptive_cfg,
         )
 
-        # Compute sample weights
         weights = await compute_sample_weights(
             storage, lookback_days=lookback_days, config=adaptive_cfg
         )
@@ -117,6 +117,7 @@ async def send_accuracy_digest(
     report: AccuracyReport | None,
     new_threshold: float,
     old_threshold: float,
+    importance_report: str | None = None,
 ) -> None:
     """Send accuracy report via configured notification channels."""
     dispatcher = build_dispatcher(config)
@@ -124,6 +125,9 @@ async def send_accuracy_digest(
         return
 
     message = format_accuracy_digest(report, new_threshold, old_threshold)
+    if importance_report:
+        message += "\n\n" + importance_report
+
     for channel in dispatcher._channels:
         try:
             await channel.send(message)
@@ -203,11 +207,11 @@ def main() -> None:
     old_threshold = scoring_cfg.get("current_flat_threshold", DEFAULT_FLAT_THRESHOLD)
 
     # Step 1: Gap-fill recent candles
-    logging.info("Step 1/6: Gap-filling recent candle data...")
+    logging.info("Step 1/8: Gap-filling recent candle data...")
     asyncio.run(gap_fill(args.db))
 
-    # Step 2-4: Score predictions, compute accuracy, tune threshold + weights
-    logging.info("Step 2/6: Scoring predictions and computing accuracy...")
+    # Step 2: Score predictions and tune
+    logging.info("Step 2/8: Scoring predictions and computing accuracy...")
     report, new_threshold, symbol_weights = asyncio.run(
         run_scoring_and_tuning(args.db, scoring_cfg)
     )
@@ -220,44 +224,28 @@ def main() -> None:
             report.total_scored,
         )
 
-    logging.info("Step 3/6: Threshold %.4f -> %.4f", old_threshold, new_threshold)
+    logging.info("Step 3/8: Threshold %.4f -> %.4f", old_threshold, new_threshold)
 
-    # Step 4: Send accuracy digest
-    logging.info("Step 4/6: Sending accuracy digest...")
-    asyncio.run(send_accuracy_digest(config, report, new_threshold, old_threshold))
-
-    # Step 5: Back up existing checkpoint
-    logging.info("Step 5/6: Backing up existing model checkpoint...")
+    # Step 4: Back up existing checkpoint
+    logging.info("Step 4/8: Backing up existing model checkpoint...")
     backup_checkpoint()
 
-    # Step 6: Retrain on rolling window with adaptive weights
+    # Step 5: Load data and train
     logging.info(
-        "Step 6/6: Retraining on %d-day rolling window (epochs=%d, patience=%d, threshold=%.4f)...",
-        rolling_days,
-        epochs,
-        patience,
-        new_threshold,
+        "Step 5/8: Retraining on %d-day rolling window (epochs=%d, patience=%d, threshold=%.4f)...",
+        rolling_days, epochs, patience, new_threshold,
     )
 
-    combined = asyncio.run(
+    symbol_data = asyncio.run(
         load_training_data(args.db, rolling_days=rolling_days)
     )
 
     feature_cols = get_feature_columns()
 
-    # Normalize features
-    for col in feature_cols:
-        mean = combined[col].mean()
-        std = combined[col].std()
-        if std > 0:
-            combined[col] = (combined[col] - mean) / std
-        else:
-            combined[col] = 0.0
-
     # Walk-forward splits with adaptive threshold and weights
     use_weights = bool(symbol_weights)
     splits = walk_forward_split(
-        combined,
+        symbol_data,
         n_splits=folds,
         window_size=window_size,
         horizon=1,
@@ -273,9 +261,20 @@ def main() -> None:
     train_ds, val_ds = splits[-1]
     logging.info(
         "Training on final fold: %d train / %d val samples",
-        len(train_ds),
-        len(val_ds),
+        len(train_ds), len(val_ds),
     )
+
+    # Compute class weights for balanced training
+    label_counts = train_ds.get_label_counts()
+    logging.info(
+        "Label distribution: UP=%d, FLAT=%d, DOWN=%d",
+        label_counts[0], label_counts[1], label_counts[2],
+    )
+    class_weights = None
+    if label_counts.min() > 0:
+        inv_freq = 1.0 / label_counts.astype(np.float64)
+        normed = (inv_freq / inv_freq.sum()) * 3
+        class_weights = torch.tensor(normed, dtype=torch.float32)
 
     trainer = Trainer(
         num_features=len(feature_cols),
@@ -286,12 +285,40 @@ def main() -> None:
         batch_size=64,
         max_epochs=epochs,
         patience=patience,
+        class_weights=class_weights,
     )
 
     history = trainer.fit(
         train_ds, val_ds, tag="retrain", use_sample_weights=use_weights
     )
+
+    # Step 6: Calibrate temperature
+    logging.info("Step 6/8: Calibrating probability temperature...")
+    trainer.calibrate_temperature(val_ds)
+
     final_path = trainer.save_final()
+
+    # Step 7: Permutation importance
+    logging.info("Step 7/8: Computing permutation importance...")
+    importance_text = None
+    try:
+        importances = compute_permutation_importance(
+            model=trainer.model,
+            dataset=val_ds,
+            feature_names=feature_cols,
+            device=trainer.device,
+            n_repeats=3,
+        )
+        importance_text = format_importance_report(importances)
+        logging.info("\n%s", importance_text)
+    except Exception as exc:
+        logging.warning("Permutation importance failed: %s", exc)
+
+    # Step 8: Send digest
+    logging.info("Step 8/8: Sending accuracy digest...")
+    asyncio.run(
+        send_accuracy_digest(config, report, new_threshold, old_threshold, importance_text)
+    )
 
     elapsed = (datetime.now(timezone.utc) - start).total_seconds()
     logging.info("=" * 60)
