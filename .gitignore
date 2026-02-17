@@ -144,3 +144,10 @@ config.ini
 secrets.json
 *.key
 *.pem
+
+# PA Bot data (local only)
+data/ohlcv.db
+data/ohlcv.db-wal
+data/ohlcv.db-shm
+data/models/*.pt
+logs/

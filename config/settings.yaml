@@ -1,0 +1,90 @@
+# PA Bot Configuration
+# Copy this file and fill in your credentials.
+# Secrets can also be set via environment variables (see .env.example).
+
+# ---------------------------------------------------------------
+# BitUnix API (only needed for authenticated endpoints / trading)
+# Public market data endpoints do NOT require keys.
+# ---------------------------------------------------------------
+bitunix:
+  api_key: ""
+  api_secret: ""
+
+# ---------------------------------------------------------------
+# Model parameters
+# ---------------------------------------------------------------
+model:
+  window_size: 168        # input window in hours (168 = 7 days)
+  hidden_dim: 128         # LSTM hidden units per direction
+  num_layers: 2           # LSTM layers
+  dropout: 0.3
+  checkpoint: "data/models/model_final.pt"
+
+# ---------------------------------------------------------------
+# Pipeline settings
+# ---------------------------------------------------------------
+pipeline:
+  interval: "60"          # candle interval (minutes): 60 = 1h
+  lookback_candles: 10    # how many recent candles to fetch each run
+  top_n_signals: 10       # number of top signals to include in alerts
+
+# ---------------------------------------------------------------
+# Notification channels
+# Set "enabled: true" and fill in credentials for each channel.
+# ---------------------------------------------------------------
+notifications:
+  discord:
+    enabled: false
+    webhook_url: ""       # https://discord.com/api/webhooks/...
+
+  telegram:
+    enabled: false
+    bot_token: ""         # from @BotFather
+    chat_id: ""           # your chat/group ID
+
+  email:
+    enabled: false
+    smtp_host: "smtp.gmail.com"
+    smtp_port: 587
+    use_tls: true
+    username: ""
+    password: ""          # app-specific password recommended
+    from_addr: ""
+    to_addrs:
+      - ""
+
+# ---------------------------------------------------------------
+# Data storage
+# ---------------------------------------------------------------
+storage:
+  db_path: "data/ohlcv.db"
+
+# ---------------------------------------------------------------
+# Scoring & adaptive feedback loop
+# Controls how predictions are evaluated and the model self-corrects.
+# ---------------------------------------------------------------
+scoring:
+  horizon_hours: 1              # how far ahead to look for actual outcome
+  current_flat_threshold: 0.005 # starting FLAT_THRESHOLD (auto-tuned daily)
+  flat_threshold_min: 0.002     # lower bound for auto-tuning
+  flat_threshold_max: 0.015     # upper bound for auto-tuning
+  threshold_ema_alpha: 0.3      # smoothing factor (0=no change, 1=instant)
+  weight_lookback_days: 7       # days of prediction errors to use for sample weights
+  min_preds_for_weight: 5       # min scored predictions per symbol before weighting
+
+# ---------------------------------------------------------------
+# Daily retrain settings
+# The daily_retrain.py cron job uses these to keep the model fresh.
+# ---------------------------------------------------------------
+retrain:
+  rolling_days: 60        # train on last N days of data (60 ≈ 2 months)
+  epochs: 50              # max epochs per retrain (lower than initial)
+  patience: 8             # early stopping patience
+  folds: 3                # walk-forward CV folds
+
+# ---------------------------------------------------------------
+# Backfill settings
+# ---------------------------------------------------------------
+backfill:
+  total_candles: 2000     # per symbol (~83 days of hourly data)
+  concurrency: 5          # max parallel API requests

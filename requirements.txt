@@ -1,0 +1,26 @@
+# PA Bot - Python Dependencies
+# Install: pip install -r requirements.txt
+
+# Deep Learning
+torch>=2.0
+
+# Data & Analysis
+pandas>=2.0
+numpy>=1.24
+scikit-learn>=1.3
+
+# Technical Analysis
+ta>=0.11
+
+# Async HTTP
+aiohttp>=3.9
+
+# Async SQLite
+aiosqlite>=0.19
+
+# Configuration
+pyyaml>=6.0
+python-dotenv>=1.0
+
+# Optional: charting / visualization
+matplotlib>=3.7
