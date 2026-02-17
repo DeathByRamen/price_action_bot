@@ -209,7 +209,7 @@ The daily retrain:
 
 ## Technical Indicators
 
-The feature engineering module computes 35+ indicators:
+The feature engineering module computes 41 scale-invariant indicators:
 
 | Category   | Indicators                                                    |
 |------------|---------------------------------------------------------------|
@@ -217,7 +217,8 @@ The feature engineering module computes 35+ indicators:
 | Momentum   | RSI(14), Stochastic RSI, Williams %R, ROC(12)                 |
 | Volatility | Bollinger Bands(20,2), ATR(14), Keltner Channels              |
 | Volume     | OBV, Acc/Dist, Volume SMA Ratio, Volume Z-Score, VWAP         |
-| Custom     | % changes (1h/4h/24h), candle ratios, EMA crosses, BB signals |
+| Custom     | % changes (1h/4h/24h/3d/7d), candle ratios, EMA crosses, BB signals |
+| Anti-pump  | Price position (2d/7d range), momentum acceleration, ATR expansion, volume-price divergence |
 
 ## Notifications
 
@@ -228,6 +229,140 @@ Enable any combination in `config/settings.yaml`:
 - **Email:** Configure SMTP credentials (Gmail app passwords recommended)
 
 Alert format includes a ranked table of top N signals with direction, confidence, predicted magnitude, current price, and signal score.
+
+## Local Setup (Windows, Tested Step-by-Step)
+
+These are the exact commands that worked on a fresh Windows machine with Python 3.11.
+
+### 1. Clone the repo
+
+```powershell
+cd C:\Users\seanm\Documents\git
+git clone https://github.com/DeathByRamen/price_action_bot.git pa_bot
+cd pa_bot
+```
+
+### 2. Create a virtual environment
+
+```powershell
+python -m venv venv
+venv\Scripts\activate
+```
+
+You should see `(venv)` in your prompt.
+
+### 3. Install the Visual C++ Redistributable
+
+PyTorch on Windows requires this. Download and run:
+
+https://aka.ms/vs/17/release/vc_redist.x64.exe
+
+Restart your terminal after installing.
+
+### 4. Install dependencies (CPU PyTorch)
+
+```powershell
+venv\Scripts\activate
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+```
+
+**Important:** Use `--index-url` (not `--extra-index-url`) for the first torch install to force the CPU-only build. The default pip install pulls the CUDA version which fails without NVIDIA drivers.
+
+Verify torch works:
+
+```powershell
+python -c "import torch; print(torch.__version__)"
+```
+
+Should print something like `2.10.0+cpu`.
+
+### 5. Set up email notifications
+
+```powershell
+copy .env.example .env
+```
+
+Edit `.env` and add your Gmail app password:
+
+```
+SMTP_PASSWORD=yourapppasswordhere
+```
+
+To get a Gmail app password:
+1. Go to https://myaccount.google.com/security
+2. Enable 2-Step Verification
+3. Go to https://myaccount.google.com/apppasswords
+4. Create one named "PA Bot", copy the 16-character password (remove spaces)
+
+Then in `config/settings.yaml`, set:
+- `email.enabled: true`
+- `email.username: "youremail@gmail.com"`
+- `email.from_addr: "youremail@gmail.com"`
+- `email.to_addrs: ["youremail@gmail.com"]`
+
+Leave `password: ""` in settings.yaml -- it reads from `.env` instead (which is gitignored).
+
+### 6. Backfill historical data
+
+```powershell
+python scripts/backfill_data.py --candles 2000
+```
+
+Takes 5-15 minutes. Data is written to `data/ohlcv.db` (SQLite).
+
+For multi-timeframe (1h + 15m):
+
+```powershell
+python scripts/backfill_data.py --candles 2000 --all-timeframes
+```
+
+### 7. Train the model
+
+```powershell
+# Train 1h model
+python scripts/train_model.py --epochs 100 --window 168 --patience 10 --interval 60
+
+# Train 15m model (for multi-timeframe)
+python scripts/train_model.py --epochs 100 --window 672 --patience 10 --interval 15
+```
+
+Takes 5-30 minutes on CPU. Checkpoints saved to `data/models/`.
+
+### 8. Run a prediction
+
+```powershell
+# Single timeframe
+python scripts/run_prediction.py
+
+# Multi-timeframe ensemble
+python scripts/run_prediction.py --multi-timeframe
+```
+
+### 9. Automate with Windows Task Scheduler
+
+Open Task Scheduler and create two tasks:
+
+**Predictions (every 15 min):**
+- Trigger: Daily, repeat every 15 minutes
+- Program: `C:\Users\seanm\Documents\git\pa_bot\venv\Scripts\python.exe`
+- Arguments: `scripts/run_prediction.py --multi-timeframe`
+- Start in: `C:\Users\seanm\Documents\git\pa_bot`
+
+**Daily retrain (once per day at 00:05 UTC):**
+- Program: `C:\Users\seanm\Documents\git\pa_bot\venv\Scripts\python.exe`
+- Arguments: `scripts/daily_retrain.py`
+- Start in: `C:\Users\seanm\Documents\git\pa_bot`
+
+### Viewing the database
+
+Install the **SQLite Viewer** extension in VS Code/Cursor (by Florian Klampfer), then click on `data/ohlcv.db` to browse tables.
+
+Or use Python:
+
+```powershell
+python -c "import sqlite3; conn = sqlite3.connect('data/ohlcv.db'); print('Candles:', conn.execute('SELECT COUNT(*) FROM ohlcv').fetchone()[0]); print('Symbols:', conn.execute('SELECT COUNT(DISTINCT symbol) FROM ohlcv').fetchone()[0]); conn.close()"
+```
 
 ## License
 

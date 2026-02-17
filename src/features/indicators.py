@@ -123,6 +123,35 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["pct_change_4"] = c.pct_change(4)
     df["pct_change_24"] = c.pct_change(24)
 
+    # Multi-day momentum — captures extended pumps/dumps
+    df["pct_change_72"] = c.pct_change(72)    # 3-day change (or 3d of 1h candles)
+    df["pct_change_168"] = c.pct_change(168)  # 7-day change
+
+    # Distance from rolling high/low — how extended is the current price?
+    # Near 1.0 = at the high (potential reversal), near 0.0 = at the low
+    high_48 = h.rolling(48).max()
+    low_48 = l.rolling(48).min()
+    range_48 = (high_48 - low_48).replace(0, np.nan)
+    df["price_position_48"] = (c - low_48) / range_48  # 0-1 bounded
+
+    high_168 = h.rolling(168).max()
+    low_168 = l.rolling(168).min()
+    range_168 = (high_168 - low_168).replace(0, np.nan)
+    df["price_position_168"] = (c - low_168) / range_168  # 0-1 bounded
+
+    # Pump/dump detector: price acceleration (rate of change of rate of change)
+    roc_short = c.pct_change(4)
+    roc_long = c.pct_change(24)
+    df["momentum_accel"] = roc_short - (roc_long / 6)  # normalized to same scale
+
+    # Volatility expansion: current ATR vs historical ATR (mean reversion signal)
+    atr_sma_48 = atr_raw.rolling(48).mean().replace(0, np.nan)
+    df["atr_expansion"] = atr_raw / atr_sma_48  # >1 = volatility expanding
+
+    # Volume-price divergence: big volume but small price move = distribution
+    abs_pct = c.pct_change(1).abs().replace(0, np.nan)
+    df["vol_price_ratio"] = df["vol_sma_ratio"] / (abs_pct * 100 + 0.01)
+
     body = c - o
     candle_range = h - l
     candle_range_safe = candle_range.replace(0, np.nan)
@@ -162,9 +191,14 @@ def get_feature_columns() -> list[str]:
         "obv_roc", "acc_dist_roc", "vol_sma_ratio", "vol_z_score", "vwap_dist",
         # Custom (ratios / percentages)
         "pct_change_1", "pct_change_4", "pct_change_24",
+        "pct_change_72", "pct_change_168",
         "candle_body_ratio", "upper_wick_ratio", "lower_wick_ratio",
         "ema_9_21_cross", "ema_21_50_cross",
         "price_vs_bb_upper", "price_vs_bb_lower",
+        # Anti-pump/dump & mean reversion
+        "price_position_48", "price_position_168",
+        "momentum_accel", "atr_expansion",
+        "vol_price_ratio",
     ]
 
 
