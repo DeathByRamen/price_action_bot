@@ -148,6 +148,13 @@ def main() -> None:
         help="Candle interval to train on: 15, 30, 60, etc. (default: 60). "
              "Checkpoint is saved as model_final_{interval}.pt",
     )
+    parser.add_argument(
+        "--flat-threshold",
+        type=float,
+        default=None,
+        help="FLAT threshold for labeling (default: 0.005 for 60m, auto-scaled for shorter intervals). "
+             "Moves smaller than this are labeled FLAT.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -157,6 +164,14 @@ def main() -> None:
 
     interval = args.interval
     logging.info("Training for %sm interval", interval)
+
+    # Auto-scale FLAT threshold for shorter intervals if not explicitly set
+    if args.flat_threshold is not None:
+        flat_threshold = args.flat_threshold
+    else:
+        interval_mins = int(interval) if interval.isdigit() else 60
+        flat_threshold = 0.005 * (interval_mins / 60.0)
+    logging.info("FLAT threshold: %.4f (%.2f%%)", flat_threshold, flat_threshold * 100)
 
     if args.rolling_days:
         logging.info("Rolling window: using last %d days of data per symbol", args.rolling_days)
@@ -178,6 +193,7 @@ def main() -> None:
         window_size=args.window,
         horizon=args.horizon,
         feature_cols=feature_cols,
+        flat_threshold=flat_threshold,
     )
 
     if not splits:

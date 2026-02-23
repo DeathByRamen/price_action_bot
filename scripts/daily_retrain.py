@@ -419,6 +419,11 @@ async def async_main(args: argparse.Namespace) -> None:
             "Step %d/%d: Retraining %sm model (%d-day window, epochs=%d, patience=%d)...",
             step, total_steps, interval, rolling_days, epochs, patience,
         )
+        # Scale FLAT threshold for shorter intervals
+        interval_mins = int(interval) if interval.isdigit() else 60
+        scaled_threshold = new_threshold * (interval_mins / 60.0)
+        logging.info("[%sm] FLAT threshold scaled to %.4f", interval, scaled_threshold)
+
         final_path, history, _imp = await _train_single_timeframe(
             db_path=args.db,
             interval=interval,
@@ -428,7 +433,7 @@ async def async_main(args: argparse.Namespace) -> None:
             epochs=epochs,
             patience=patience,
             folds=folds,
-            new_threshold=new_threshold,
+            new_threshold=scaled_threshold,
             symbol_weights=symbol_weights,
             feature_cols=feature_cols,
         )
