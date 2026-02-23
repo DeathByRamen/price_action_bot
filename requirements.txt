@@ -30,23 +30,20 @@ python-dotenv>=1.0
 # Visualization
 matplotlib>=3.7
 
-# --- Optional (install individually as needed) ---
+# Gradient boosting (multi-model ensemble)
+lightgbm>=4.0
 
-# Gradient boosting (Phase 5)
-# lightgbm>=4.0
+# Hyperparameter optimization
+optuna>=3.0
 
-# Hyperparameter optimization (Phase 5)
-# optuna>=3.0
+# Regime detection (HMM)
+hmmlearn>=0.3
 
-# Regime detection (Phase 6)
-# hmmlearn>=0.3
+# PostgreSQL / TimescaleDB backend
+asyncpg>=0.29
 
-# PostgreSQL backend (Phase 7)
-# asyncpg>=0.29
+# Prometheus metrics
+prometheus-client>=0.19
 
-# Prometheus metrics (Phase 7)
-# prometheus-client>=0.19
-
-# Testing
-# pytest>=7.0
-# pytest-asyncio>=0.21
+# WebSocket streaming
+websockets>=12.0

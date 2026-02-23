@@ -186,6 +186,10 @@ def get_feature_columns() -> list[str]:
         get_funding_rate_feature_columns,
     )
     from src.features.orderbook import get_orderbook_feature_columns
+    from src.features.sentiment import (
+        get_cross_exchange_feature_columns,
+        get_sentiment_feature_columns,
+    )
 
     return [
         # Trend (price-relative)
@@ -218,6 +222,10 @@ def get_feature_columns() -> list[str]:
         *get_funding_rate_feature_columns(),
         # Cross-asset features
         *get_cross_asset_feature_columns(),
+        # Sentiment features
+        *get_sentiment_feature_columns(),
+        # Cross-exchange features
+        *get_cross_exchange_feature_columns(),
     ]
 
 

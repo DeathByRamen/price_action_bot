@@ -63,7 +63,7 @@ class TestComputeIndicators:
 
     def test_full_feature_count(self):
         cols = get_feature_columns()
-        assert len(cols) == 60, f"Expected 60 total features, got {len(cols)}"
+        assert len(cols) == 66, f"Expected 66 total features, got {len(cols)}"
 
     def test_no_duplicates_in_feature_list(self):
         cols = get_feature_columns()

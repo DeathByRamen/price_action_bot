@@ -65,9 +65,13 @@ notifications:
 
 # ---------------------------------------------------------------
 # Data storage
+# SQLite is default. Set postgres.enabled: true to use TimescaleDB.
 # ---------------------------------------------------------------
 storage:
   db_path: "data/ohlcv.db"
+  postgres:
+    enabled: false
+    dsn: "postgresql://pabot:pabot@localhost:5432/pabot"  # or set DATABASE_URL env var
 
 # ---------------------------------------------------------------
 # Scoring & adaptive feedback loop
@@ -120,6 +124,21 @@ risk:
   max_spread_bps: 50.0        # maximum spread in basis points
   drawdown_reduce_pct: 5.0    # reduce signal count at this drawdown %
   drawdown_halt_pct: 10.0     # halt all signals at this drawdown %
+
+# ---------------------------------------------------------------
+# Sentiment data (Fear & Greed + CryptoPanic)
+# ---------------------------------------------------------------
+sentiment:
+  enabled: true
+  cryptopanic_api_key: ""   # free tier: 200 req/day, or set CRYPTOPANIC_API_KEY env var
+  fear_greed_enabled: true  # Alternative.me — no key needed
+
+# ---------------------------------------------------------------
+# Binance public API (cross-exchange features)
+# No API key required — uses public endpoints only
+# ---------------------------------------------------------------
+binance:
+  enabled: true
 
 # ---------------------------------------------------------------
 # Backfill settings

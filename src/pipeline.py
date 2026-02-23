@@ -131,10 +131,20 @@ async def run_pipeline(
 
     # 1. Set up components
     dispatcher = build_dispatcher(config)
+
+    # Load model Sharpe ratios from DB for ensemble weighting
+    model_sharpes = {}
+    try:
+        async with Storage(db_path) as _s:
+            model_sharpes = await _s.get_model_sharpes(interval)
+    except Exception:
+        pass
+
     predictor = Predictor(
         model_path=model_path,
         hidden_dim=hidden_dim,
         window_size=window_size,
+        model_sharpes=model_sharpes,
     )
 
     all_predictions: List[Prediction] = []
@@ -199,6 +209,25 @@ async def run_pipeline(
                 try:
                     if not btc_df.empty and symbol != "BTCUSDT":
                         df = compute_cross_asset_features(btc_df, df)
+                except Exception:
+                    pass
+
+                # Sentiment + cross-exchange features
+                try:
+                    from src.features.sentiment import (
+                        compute_cross_exchange_features,
+                        compute_sentiment_features,
+                    )
+                    fg_df = await storage.get_fear_greed(start_ts=start_ts, limit=candle_limit)
+                    news_df = await storage.get_news_sentiment(symbol, start_ts=start_ts, limit=candle_limit)
+                    if not fg_df.empty or not news_df.empty:
+                        df = compute_sentiment_features(fg_df, news_df, df)
+
+                    bn_fr_df = await storage.get_binance_funding_rate(symbol, start_ts=start_ts, limit=candle_limit)
+                    bn_oi_df = await storage.get_binance_oi(symbol, start_ts=start_ts, limit=candle_limit)
+                    bx_fr_df = await storage.get_funding_rate_snapshots(symbol, start_ts=start_ts, limit=candle_limit)
+                    if not bn_fr_df.empty or not bn_oi_df.empty:
+                        df = compute_cross_exchange_features(bn_fr_df, bn_oi_df, bx_fr_df, df)
                 except Exception:
                     pass
 

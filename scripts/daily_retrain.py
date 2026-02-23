@@ -257,6 +257,29 @@ async def _train_single_timeframe(
         db_path, rolling_days=rolling_days, interval=interval
     )
 
+    # Regime-aware training: detect current regime and adjust hyperparams
+    regime_label = "Unknown"
+    regime_lr_mult = 1.0
+    regime_dropout_adj = 0.0
+    try:
+        from src.model.regime import REGIME_NAMES, RegimeDetector
+        if "BTCUSDT" in symbol_data:
+            detector = RegimeDetector()
+            detector.fit(symbol_data["BTCUSDT"])
+            regime = detector.predict(symbol_data["BTCUSDT"])
+            regime_label = REGIME_NAMES.get(regime, "Unknown")
+            from src.model.regime import MarketRegime
+            if regime == MarketRegime.HIGH_VOLATILITY:
+                regime_lr_mult = 0.5
+                regime_dropout_adj = 0.1
+                logging.info("[%sm] High volatility regime — reducing LR by 50%%, increasing dropout", interval)
+            elif regime == MarketRegime.RANGING:
+                regime_lr_mult = 0.8
+                logging.info("[%sm] Ranging regime — reducing LR by 20%%", interval)
+            logging.info("[%sm] Current regime: %s", interval, regime_label)
+    except Exception as exc:
+        logging.warning("[%sm] Regime detection failed: %s", interval, exc)
+
     use_weights = bool(symbol_weights)
     splits = walk_forward_split(
         symbol_data,
@@ -271,6 +294,30 @@ async def _train_single_timeframe(
     if not splits:
         logging.error("No valid splits for %sm model. Skipping.", interval)
         return "", {}, {}
+
+    # CV ensemble: train a model on each fold and save
+    fold_paths = []
+    for fold_idx, (fold_train, fold_val) in enumerate(splits[:-1]):
+        try:
+            logging.info("[%sm] Training CV fold %d/%d...", interval, fold_idx + 1, len(splits) - 1)
+            fold_label_counts = fold_train.get_label_counts()
+            fold_cw = None
+            if fold_label_counts.min() > 0:
+                inv = 1.0 / fold_label_counts.astype(np.float64)
+                fold_cw = torch.tensor((inv / inv.sum()) * 3, dtype=torch.float32).clamp(max=3.0)
+            fold_trainer = Trainer(
+                num_features=len(feature_cols), hidden_dim=hidden_dim,
+                num_layers=2, dropout=0.3, lr=1e-3, batch_size=64,
+                max_epochs=max(epochs // 2, 15), patience=patience,
+                class_weights=fold_cw,
+            )
+            fold_trainer.fit(fold_train, fold_val, tag=f"fold_{fold_idx}_{interval}")
+            fold_trainer.calibrate_temperature(fold_val)
+            fp = fold_trainer.save_final(tag=f"final_{interval}_fold{fold_idx}", feature_cols=feature_cols)
+            fold_paths.append(fp)
+            logging.info("[%sm] Fold %d saved to %s", interval, fold_idx + 1, fp)
+        except Exception as exc:
+            logging.warning("[%sm] Fold %d training failed: %s", interval, fold_idx + 1, exc)
 
     train_ds, val_ds = splits[-1]
     logging.info(
@@ -290,12 +337,14 @@ async def _train_single_timeframe(
         class_weights = torch.tensor(normed, dtype=torch.float32)
         class_weights = class_weights.clamp(max=3.0)
 
+    adjusted_lr = 1e-3 * regime_lr_mult
+    adjusted_dropout = min(0.3 + regime_dropout_adj, 0.5)
     trainer = Trainer(
         num_features=len(feature_cols),
         hidden_dim=hidden_dim,
         num_layers=2,
-        dropout=0.3,
-        lr=1e-3,
+        dropout=adjusted_dropout,
+        lr=adjusted_lr,
         batch_size=64,
         max_epochs=epochs,
         patience=patience,
@@ -407,6 +456,81 @@ async def _train_single_timeframe(
         final_path = deploy_path
         logging.info("[%sm] Rolled back to previous checkpoint: %s", interval, deploy_path)
 
+    # --- Train TFT model ---
+    tft_sharpe = 0.0
+    try:
+        from torch.optim import AdamW
+        from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+        from src.model.tft import TemporalFusionTransformer
+        logging.info("[%sm] Training TFT model...", interval)
+        tft_trainer = Trainer(
+            num_features=len(feature_cols),
+            hidden_dim=64,
+            num_layers=1,
+            dropout=0.3,
+            lr=1e-3,
+            batch_size=64,
+            max_epochs=epochs,
+            patience=patience,
+            class_weights=class_weights,
+        )
+        tft_model = TemporalFusionTransformer(
+            num_features=len(feature_cols), d_model=64, num_heads=4,
+            num_lstm_layers=1, dropout=0.3,
+        ).to(tft_trainer.device)
+        tft_trainer.model = tft_model
+        tft_trainer.optimizer = AdamW(tft_model.parameters(), lr=1e-3, weight_decay=1e-4)
+        tft_trainer.scheduler = ReduceLROnPlateau(tft_trainer.optimizer, mode="min", factor=0.5, patience=5)
+        tft_history = tft_trainer.fit(
+            train_ds, val_ds, tag=f"retrain_tft_{interval}", use_sample_weights=use_weights
+        )
+        tft_trainer.calibrate_temperature(val_ds)
+        tft_trainer.save_final(tag=f"final_{interval}_tft", feature_cols=feature_cols)
+        tft_metrics = tft_trainer.evaluate(val_ds)
+        tft_sharpe = tft_metrics.get("sharpe", 0.0)
+        logging.info("[%sm] TFT training complete: val_loss=%.4f", interval,
+                     tft_history.get("val_loss", [0])[-1] if tft_history.get("val_loss") else 0)
+    except Exception as exc:
+        logging.warning("[%sm] TFT training failed: %s", interval, exc)
+
+    # --- Train GBM model ---
+    gbm_sharpe = 0.0
+    try:
+        from torch.utils.data import DataLoader
+
+        from src.model.gbm import GBMPredictor
+        logging.info("[%sm] Training GBM model...", interval)
+
+        def _extract_dataset_arrays(ds):
+            loader = DataLoader(ds, batch_size=len(ds), shuffle=False)
+            x_all, y_cls_all, y_reg_all = next(iter(loader))
+            return x_all.numpy(), y_cls_all.numpy(), y_reg_all.numpy()
+
+        X_train, y_cls_train, y_reg_train = _extract_dataset_arrays(train_ds)
+        X_val, y_cls_val, y_reg_val = _extract_dataset_arrays(val_ds)
+
+        gbm = GBMPredictor()
+        gbm.fit(X_train, y_cls_train, y_reg_train, X_val, y_cls_val, y_reg_val)
+        gbm_path = os.path.join("data", "models", f"model_final_{interval}_gbm.pkl")
+        os.makedirs(os.path.dirname(gbm_path), exist_ok=True)
+        gbm.save(gbm_path)
+        logging.info("[%sm] GBM model saved to %s", interval, gbm_path)
+    except Exception as exc:
+        logging.warning("[%sm] GBM training failed: %s", interval, exc)
+
+    # Persist model sharpes for ensemble weighting
+    lstm_sharpe = new_metrics.get("sharpe", 0.0)
+    try:
+        async with Storage(db_path) as s:
+            await s.upsert_model_sharpe(f"lstm_{interval}", interval, lstm_sharpe)
+            await s.upsert_model_sharpe(f"tft_{interval}", interval, tft_sharpe)
+            await s.upsert_model_sharpe(f"gbm_{interval}", interval, gbm_sharpe)
+        logging.info("[%sm] Model sharpes: LSTM=%.3f, TFT=%.3f, GBM=%.3f",
+                     interval, lstm_sharpe, tft_sharpe, gbm_sharpe)
+    except Exception as exc:
+        logging.warning("[%sm] Failed to persist model sharpes: %s", interval, exc)
+
     # Permutation importance — persist scores to DB
     importance_scores: dict[str, float] = {}
     try:
@@ -428,6 +552,29 @@ async def _train_single_timeframe(
         logging.info("Persisted %d importance scores for %sm", len(importance_scores), interval)
     except Exception as exc:
         logging.warning("[%sm] Permutation importance failed: %s", interval, exc)
+
+    # Automated feature retirement: track and flag features below threshold for 3+ days
+    if importance_scores:
+        try:
+            RETIRE_THRESHOLD = 0.001
+            RETIRE_DAYS = 3
+            async with Storage(db_path) as s:
+                for feat, score in importance_scores.items():
+                    if score < RETIRE_THRESHOLD:
+                        low = await s._db.execute_fetchall(
+                            "SELECT below_count FROM feature_retirement WHERE feature_name=? AND interval=?",
+                            (feat, interval),
+                        )
+                        count = (low[0][0] + 1) if low else 1
+                        is_retired = count >= RETIRE_DAYS
+                        await s.update_feature_retirement(feat, interval, count, is_retired)
+                        if is_retired:
+                            logging.info("[%sm] Feature '%s' retired (below threshold for %d days)",
+                                         interval, feat, count)
+                    else:
+                        await s.update_feature_retirement(feat, interval, 0, False)
+        except Exception as exc:
+            logging.warning("[%sm] Feature retirement update failed: %s", interval, exc)
 
     return final_path, history, importance_scores
 
@@ -600,6 +747,72 @@ async def async_main(args: argparse.Namespace) -> None:
     # Check for low-importance features across runs
     low_imp_warnings = await _get_low_importance_warnings(args.db, all_intervals)
 
+    # A/B testing: evaluate shadow model performance
+    ab_report_text = ""
+    try:
+        import json as _json
+
+        from src.model.ab_testing import ABTestConfig, ABTestManager
+        ab_state_path = os.path.join("data", "ab_test_state.json")
+        ab_manager = ABTestManager(ABTestConfig())
+
+        if os.path.exists(ab_state_path):
+            with open(ab_state_path, "r") as _f:
+                ab_data = _json.load(_f)
+            ab_manager.production.model_name = ab_data.get("production_name", "production")
+            ab_manager.shadow.model_name = ab_data.get("shadow_name", "shadow")
+            ab_manager.production.start_date = ab_data.get("start_date", "")
+            for p in ab_data.get("production_pnls", []):
+                ab_manager.production.pnls.append(p)
+            for p in ab_data.get("shadow_pnls", []):
+                ab_manager.shadow.pnls.append(p)
+
+            result = ab_manager.evaluate()
+            ab_report_text = (
+                f"\n**A/B Test:** {result.get('reason', '')}\n"
+                f"  Production Sharpe: {result.get('production_sharpe', 0):.3f}\n"
+                f"  Shadow Sharpe: {result.get('shadow_sharpe', 0):.3f}"
+            )
+            if result.get("should_promote"):
+                logging.info("A/B test: Shadow model wins — promotion recommended")
+                ab_report_text += "\n  >> PROMOTION RECOMMENDED <<"
+        else:
+            if trained_models:
+                ab_manager.start_test("production", "shadow_new")
+                os.makedirs(os.path.dirname(ab_state_path), exist_ok=True)
+                with open(ab_state_path, "w") as _f:
+                    _json.dump({
+                        "production_name": "production",
+                        "shadow_name": "shadow_new",
+                        "start_date": datetime.now(timezone.utc).isoformat(),
+                        "production_pnls": [],
+                        "shadow_pnls": [],
+                    }, _f)
+                ab_report_text = "\n**A/B Test:** New shadow test started"
+    except Exception as exc:
+        logging.warning("A/B testing failed: %s", exc)
+
+    # Meta-learner performance tracking
+    try:
+        from src.model.meta_learning import MetaLearner
+        meta = MetaLearner()
+        if report and report.total_scored > 0:
+            for interval_str, _, _ in trained_models:
+                for model_type in ["lstm", "tft", "gbm"]:
+                    model_key = f"{model_type}_{interval_str}"
+                    async with Storage(args.db) as s:
+                        sharpe = (await s.get_model_sharpes(interval_str)).get(model_key, 0.0)
+                    meta.record_performance(
+                        model_name=model_key, symbol="ALL", regime=0,
+                        sharpe=sharpe, accuracy=report.direction_accuracy,
+                        n_predictions=report.total_scored,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                    )
+            summary = meta.get_performance_summary()
+            logging.info("Meta-learner summary: %s", summary)
+    except Exception as exc:
+        logging.warning("Meta-learner tracking failed: %s", exc)
+
     # Final step: Send digest
     step += 1
     logging.info("Step %d/%d: Sending accuracy digest...", step, total_steps)
@@ -610,6 +823,8 @@ async def async_main(args: argparse.Namespace) -> None:
         extra_sections.append(drift_report_text)
     if low_imp_warnings:
         extra_sections.append(low_imp_warnings)
+    if ab_report_text:
+        extra_sections.append(ab_report_text)
     extra_report = "\n".join(extra_sections) if extra_sections else None
     await send_accuracy_digest(config, report, new_threshold, old_threshold, extra_report)
 

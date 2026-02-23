@@ -169,6 +169,64 @@ CREATE TABLE IF NOT EXISTS coinalyze_long_short (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ca_ls_sym_ts ON coinalyze_long_short(symbol, ts);
+
+CREATE TABLE IF NOT EXISTS fear_greed_index (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         TEXT    NOT NULL,
+    value      REAL    NOT NULL,
+    label      TEXT,
+    created_at TEXT    DEFAULT (datetime('now')),
+    UNIQUE(ts)
+);
+
+CREATE TABLE IF NOT EXISTS news_sentiment (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol     TEXT    NOT NULL,
+    ts         TEXT    NOT NULL,
+    positive   INTEGER NOT NULL DEFAULT 0,
+    negative   INTEGER NOT NULL DEFAULT 0,
+    neutral    INTEGER NOT NULL DEFAULT 0,
+    total      INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT    DEFAULT (datetime('now')),
+    UNIQUE(symbol, ts)
+);
+
+CREATE TABLE IF NOT EXISTS binance_funding_rate (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol        TEXT    NOT NULL,
+    ts            TEXT    NOT NULL,
+    funding_rate  REAL    NOT NULL,
+    created_at    TEXT    DEFAULT (datetime('now')),
+    UNIQUE(symbol, ts)
+);
+
+CREATE TABLE IF NOT EXISTS binance_oi (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol     TEXT    NOT NULL,
+    ts         TEXT    NOT NULL,
+    oi_value   REAL    NOT NULL,
+    created_at TEXT    DEFAULT (datetime('now')),
+    UNIQUE(symbol, ts)
+);
+
+CREATE TABLE IF NOT EXISTS model_sharpes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_name TEXT    NOT NULL,
+    interval   TEXT    NOT NULL DEFAULT '60',
+    sharpe     REAL    NOT NULL DEFAULT 0.0,
+    updated_at TEXT    DEFAULT (datetime('now')),
+    UNIQUE(model_name, interval)
+);
+
+CREATE TABLE IF NOT EXISTS feature_retirement (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    feature_name    TEXT    NOT NULL,
+    interval        TEXT    NOT NULL DEFAULT '60',
+    below_count     INTEGER NOT NULL DEFAULT 0,
+    is_retired      INTEGER NOT NULL DEFAULT 0,
+    updated_at      TEXT    DEFAULT (datetime('now')),
+    UNIQUE(feature_name, interval)
+);
 """
 
 MIGRATION_SQL = """
@@ -1008,3 +1066,145 @@ class Storage:
         return pd.DataFrame(
             rows, columns=["symbol", "ts", "ratio", "long_pct", "short_pct"],
         )
+
+    # ------------------------------------------------------------------
+    # Fear & Greed Index
+    # ------------------------------------------------------------------
+    async def insert_fear_greed(self, rows: List[Tuple]) -> int:
+        assert self._db is not None
+        sql = "INSERT OR IGNORE INTO fear_greed_index (ts, value, label) VALUES (?, ?, ?)"
+        cursor = await self._db.executemany(sql, rows)
+        await self._db.commit()
+        return cursor.rowcount
+
+    async def get_fear_greed(
+        self, start_ts: Optional[str] = None, limit: int = 500
+    ) -> pd.DataFrame:
+        assert self._db is not None
+        if start_ts:
+            sql = "SELECT ts, value, label FROM fear_greed_index WHERE ts >= ? ORDER BY ts ASC LIMIT ?"
+            rows = await self._db.execute_fetchall(sql, (start_ts, limit))
+        else:
+            sql = "SELECT ts, value, label FROM fear_greed_index ORDER BY ts DESC LIMIT ?"
+            rows = await self._db.execute_fetchall(sql, (limit,))
+        return pd.DataFrame(rows, columns=["ts", "value", "label"])
+
+    # ------------------------------------------------------------------
+    # News Sentiment
+    # ------------------------------------------------------------------
+    async def insert_news_sentiment(self, rows: List[Tuple]) -> int:
+        assert self._db is not None
+        sql = """
+            INSERT OR IGNORE INTO news_sentiment
+                (symbol, ts, positive, negative, neutral, total)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """
+        cursor = await self._db.executemany(sql, rows)
+        await self._db.commit()
+        return cursor.rowcount
+
+    async def get_news_sentiment(
+        self, symbol: str, start_ts: Optional[str] = None, limit: int = 500
+    ) -> pd.DataFrame:
+        assert self._db is not None
+        conditions = ["symbol = ?"]
+        params: list = [symbol]
+        if start_ts:
+            conditions.append("ts >= ?")
+            params.append(start_ts)
+        params.append(limit)
+        where = " AND ".join(conditions)
+        sql = f"SELECT symbol, ts, positive, negative, neutral, total FROM news_sentiment WHERE {where} ORDER BY ts ASC LIMIT ?"
+        rows = await self._db.execute_fetchall(sql, tuple(params))
+        return pd.DataFrame(rows, columns=["symbol", "ts", "positive", "negative", "neutral", "total"])
+
+    # ------------------------------------------------------------------
+    # Binance cross-exchange data
+    # ------------------------------------------------------------------
+    async def insert_binance_funding_rate(self, rows: List[Tuple]) -> int:
+        assert self._db is not None
+        sql = "INSERT OR IGNORE INTO binance_funding_rate (symbol, ts, funding_rate) VALUES (?, ?, ?)"
+        cursor = await self._db.executemany(sql, rows)
+        await self._db.commit()
+        return cursor.rowcount
+
+    async def get_binance_funding_rate(
+        self, symbol: str, start_ts: Optional[str] = None, limit: int = 500
+    ) -> pd.DataFrame:
+        assert self._db is not None
+        conditions = ["symbol = ?"]
+        params: list = [symbol]
+        if start_ts:
+            conditions.append("ts >= ?")
+            params.append(start_ts)
+        params.append(limit)
+        where = " AND ".join(conditions)
+        sql = f"SELECT symbol, ts, funding_rate FROM binance_funding_rate WHERE {where} ORDER BY ts ASC LIMIT ?"
+        rows = await self._db.execute_fetchall(sql, tuple(params))
+        return pd.DataFrame(rows, columns=["symbol", "ts", "funding_rate"])
+
+    async def insert_binance_oi(self, rows: List[Tuple]) -> int:
+        assert self._db is not None
+        sql = "INSERT OR IGNORE INTO binance_oi (symbol, ts, oi_value) VALUES (?, ?, ?)"
+        cursor = await self._db.executemany(sql, rows)
+        await self._db.commit()
+        return cursor.rowcount
+
+    async def get_binance_oi(
+        self, symbol: str, start_ts: Optional[str] = None, limit: int = 500
+    ) -> pd.DataFrame:
+        assert self._db is not None
+        conditions = ["symbol = ?"]
+        params: list = [symbol]
+        if start_ts:
+            conditions.append("ts >= ?")
+            params.append(start_ts)
+        params.append(limit)
+        where = " AND ".join(conditions)
+        sql = f"SELECT symbol, ts, oi_value FROM binance_oi WHERE {where} ORDER BY ts ASC LIMIT ?"
+        rows = await self._db.execute_fetchall(sql, tuple(params))
+        return pd.DataFrame(rows, columns=["symbol", "ts", "oi_value"])
+
+    # ------------------------------------------------------------------
+    # Model Sharpes (for ensemble weighting)
+    # ------------------------------------------------------------------
+    async def upsert_model_sharpe(self, model_name: str, interval: str, sharpe: float) -> None:
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT INTO model_sharpes (model_name, interval, sharpe, updated_at) "
+            "VALUES (?, ?, ?, datetime('now')) "
+            "ON CONFLICT(model_name, interval) DO UPDATE SET sharpe=excluded.sharpe, updated_at=excluded.updated_at",
+            (model_name, interval, sharpe),
+        )
+        await self._db.commit()
+
+    async def get_model_sharpes(self, interval: str = "60") -> Dict[str, float]:
+        assert self._db is not None
+        rows = await self._db.execute_fetchall(
+            "SELECT model_name, sharpe FROM model_sharpes WHERE interval = ?", (interval,)
+        )
+        return {r[0]: r[1] for r in rows}
+
+    # ------------------------------------------------------------------
+    # Feature Retirement tracking
+    # ------------------------------------------------------------------
+    async def get_feature_retirement_status(self, interval: str = "60") -> Dict[str, bool]:
+        assert self._db is not None
+        rows = await self._db.execute_fetchall(
+            "SELECT feature_name, is_retired FROM feature_retirement WHERE interval = ?",
+            (interval,),
+        )
+        return {r[0]: bool(r[1]) for r in rows}
+
+    async def update_feature_retirement(
+        self, feature_name: str, interval: str, below_count: int, is_retired: bool
+    ) -> None:
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT INTO feature_retirement (feature_name, interval, below_count, is_retired, updated_at) "
+            "VALUES (?, ?, ?, ?, datetime('now')) "
+            "ON CONFLICT(feature_name, interval) DO UPDATE SET "
+            "below_count=excluded.below_count, is_retired=excluded.is_retired, updated_at=excluded.updated_at",
+            (feature_name, interval, below_count, int(is_retired)),
+        )
+        await self._db.commit()

@@ -49,7 +49,12 @@ class Prediction:
 
 
 class Predictor:
-    """Load a trained model and run inference on prepared feature DataFrames."""
+    """Load trained models and run inference on prepared feature DataFrames.
+
+    Supports multi-model ensemble: loads LSTM (primary), TFT, and GBM
+    when their checkpoints exist. Combines via MultiModelEnsemble with
+    Sharpe-weighted averaging.
+    """
 
     def __init__(
         self,
@@ -59,6 +64,7 @@ class Predictor:
         num_layers: int = 2,
         window_size: int = 168,
         device: Optional[str] = None,
+        model_sharpes: Optional[Dict[str, float]] = None,
     ):
         self.window_size = window_size
         self.feature_cols = get_feature_columns()
@@ -73,40 +79,98 @@ class Predictor:
             num_features=num_features,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
-            dropout=0.0,  # no dropout at inference
+            dropout=0.0,
         ).to(self.device)
 
         path = model_path or DEFAULT_MODEL_PATH
-        if os.path.exists(path):
-            data = torch.load(path, map_location=self.device, weights_only=True)
-            if isinstance(data, dict) and "model_state_dict" in data:
-                ckpt_feats = data.get("num_features")
-                ckpt_hidden = data.get("hidden_dim")
-                if ckpt_feats and ckpt_feats != num_features:
-                    raise RuntimeError(
-                        f"Checkpoint expects {ckpt_feats} features but model "
-                        f"has {num_features}. Retrain required."
-                    )
-                if ckpt_hidden and ckpt_hidden != hidden_dim:
-                    raise RuntimeError(
-                        f"Checkpoint expects hidden_dim={ckpt_hidden} but model "
-                        f"has {hidden_dim}. Config mismatch."
-                    )
-                self.model.load_state_dict(data["model_state_dict"])
-                logger.info(
-                    "Loaded model from %s (temperature=%.4f, created=%s)",
-                    path, self.model.temperature.item(),
-                    data.get("created_at", "unknown"),
-                )
-            else:
-                # Legacy checkpoint: plain state_dict
-                self.model.load_state_dict(data)
-                logger.info("Loaded model from %s (legacy, temperature=%.4f)",
-                            path, self.model.temperature.item())
-        else:
-            logger.warning("No model checkpoint at %s -- predictions will be random!", path)
-
+        self._load_checkpoint(self.model, path)
         self.model.eval()
+
+        self.tft_model = None
+        self.gbm_model = None
+        self.fold_models = []
+        self.ensemble = None
+
+        self._try_load_tft(path, num_features)
+        self._try_load_gbm(path)
+        self._try_load_fold_models(path, num_features, hidden_dim, num_layers)
+        self._setup_ensemble(model_sharpes)
+
+    def _load_checkpoint(self, model, path: str) -> bool:
+        if not os.path.exists(path):
+            logger.warning("No model checkpoint at %s -- predictions will be random!", path)
+            return False
+        data = torch.load(path, map_location=self.device, weights_only=True)
+        if isinstance(data, dict) and "model_state_dict" in data:
+            model.load_state_dict(data["model_state_dict"])
+            logger.info("Loaded model from %s (temperature=%.4f)", path, model.temperature.item())
+        else:
+            model.load_state_dict(data)
+            logger.info("Loaded model from %s (legacy)", path)
+        return True
+
+    def _try_load_tft(self, lstm_path: str, num_features: int) -> None:
+        try:
+            from .tft import TemporalFusionTransformer
+            tft_path = lstm_path.replace(".pt", "_tft.pt") if lstm_path else ""
+            if not tft_path or not os.path.exists(tft_path):
+                base = os.path.dirname(lstm_path or DEFAULT_MODEL_PATH)
+                interval = os.path.basename(lstm_path or "").replace("model_final_", "").replace(".pt", "")
+                tft_path = os.path.join(base, f"model_final_{interval}_tft.pt")
+            if os.path.exists(tft_path):
+                self.tft_model = TemporalFusionTransformer(
+                    num_features=num_features, d_model=64, num_heads=4,
+                    num_lstm_layers=1, dropout=0.0,
+                ).to(self.device)
+                self._load_checkpoint(self.tft_model, tft_path)
+                self.tft_model.eval()
+                logger.info("TFT model loaded from %s", tft_path)
+        except Exception as exc:
+            logger.debug("TFT model not available: %s", exc)
+
+    def _try_load_gbm(self, lstm_path: str) -> None:
+        try:
+            from .gbm import GBMPredictor
+            base = os.path.dirname(lstm_path or DEFAULT_MODEL_PATH)
+            interval = os.path.basename(lstm_path or "").replace("model_final_", "").replace(".pt", "")
+            gbm_path = os.path.join(base, f"model_final_{interval}_gbm.pkl")
+            if os.path.exists(gbm_path):
+                self.gbm_model = GBMPredictor()
+                self.gbm_model.load(gbm_path)
+                logger.info("GBM model loaded from %s", gbm_path)
+        except Exception as exc:
+            logger.debug("GBM model not available: %s", exc)
+
+    def _try_load_fold_models(self, lstm_path: str, num_features: int, hidden_dim: int, num_layers: int) -> None:
+        """Load CV fold models for ensemble averaging."""
+        self.fold_models = []
+        base_dir = os.path.dirname(lstm_path or DEFAULT_MODEL_PATH)
+        interval = os.path.basename(lstm_path or "").replace("model_final_", "").replace(".pt", "")
+        for fold_idx in range(10):
+            fp = os.path.join(base_dir, f"model_final_{interval}_fold{fold_idx}.pt")
+            if not os.path.exists(fp):
+                break
+            try:
+                m = CryptoPredictorLSTM(
+                    num_features=num_features, hidden_dim=hidden_dim,
+                    num_layers=num_layers, dropout=0.0,
+                ).to(self.device)
+                self._load_checkpoint(m, fp)
+                m.eval()
+                self.fold_models.append(m)
+            except Exception as exc:
+                logger.debug("Fold model %d failed to load: %s", fold_idx, exc)
+        if self.fold_models:
+            logger.info("Loaded %d CV fold models for ensemble averaging", len(self.fold_models))
+
+    def _setup_ensemble(self, model_sharpes: Optional[Dict[str, float]]) -> None:
+        from .multi_ensemble import MultiModelEnsemble
+        n_models = 1 + (1 if self.tft_model else 0) + (1 if self.gbm_model else 0)
+        if n_models > 1:
+            self.ensemble = MultiModelEnsemble(weighting="sharpe")
+            if model_sharpes:
+                self.ensemble.set_model_sharpes(model_sharpes)
+            logger.info("Multi-model ensemble active with %d models", n_models)
 
     def predict_symbol(
         self,
@@ -173,7 +237,43 @@ class Predictor:
             probs = torch.softmax(scaled_logits, dim=1).squeeze(0).cpu().numpy()
             magnitude = mag_pred.squeeze().cpu().item()
 
-        uncertainty = self._estimate_uncertainty(x)
+        # CV fold averaging: average LSTM fold model outputs
+        if self.fold_models:
+            all_probs = [probs]
+            all_mags = [magnitude]
+            for fm in self.fold_models:
+                fp, fm_mag = self._run_model(fm, x)
+                all_probs.append(fp)
+                all_mags.append(fm_mag)
+            probs = np.mean(all_probs, axis=0)
+            probs /= probs.sum() + 1e-10
+            magnitude = float(np.mean(all_mags))
+
+        # Ensemble: combine LSTM + TFT + GBM predictions
+        if self.ensemble:
+            from .multi_ensemble import ModelPrediction
+            model_preds = [ModelPrediction("lstm", probs, magnitude, 0.0)]
+
+            if self.tft_model is not None:
+                tft_probs, tft_mag = self._run_model(self.tft_model, x)
+                model_preds.append(ModelPrediction("tft", tft_probs, tft_mag, 0.0))
+
+            if self.gbm_model is not None:
+                gbm_probs, gbm_mag = self._run_gbm(window)
+                model_preds.append(ModelPrediction("gbm", gbm_probs, gbm_mag, 0.0))
+
+            ens = self.ensemble.combine(model_preds, symbol=symbol)
+            probs = ens.class_probs
+            magnitude = ens.magnitude
+            # Primary uncertainty = ensemble disagreement (predictive entropy)
+            uncertainty = ens.uncertainty
+        elif self.fold_models:
+            # Use fold disagreement as uncertainty
+            all_fold_probs = [probs] + [self._run_model(fm, x)[0] for fm in self.fold_models]
+            uncertainty = float(np.std(all_fold_probs, axis=0).mean())
+        else:
+            # Fallback: MC Dropout
+            uncertainty = self._estimate_uncertainty(x)
 
         direction_idx = int(np.argmax(probs))
         direction = DIRECTION_LABELS[direction_idx]
@@ -323,6 +423,21 @@ class Predictor:
             ))
 
         return predictions
+
+    def _run_model(self, model, x: torch.Tensor) -> tuple:
+        """Run a PyTorch model and return (probs, magnitude)."""
+        with torch.no_grad():
+            cls_logits, mag_pred = model(x)[:2]
+            temp = model.temperature.clamp(min=0.01)
+            probs = torch.softmax(cls_logits / temp, dim=-1).squeeze(0).cpu().numpy()
+            mag = mag_pred.squeeze().cpu().item()
+        return probs, mag
+
+    def _run_gbm(self, window: np.ndarray) -> tuple:
+        """Run GBM model and return (probs, magnitude)."""
+        x_in = window[np.newaxis, ...]  # (1, T, F)
+        class_probs, _, mag = self.gbm_model.predict(x_in)
+        return class_probs[0], float(mag[0])
 
     def _estimate_uncertainty(self, x: torch.Tensor, n_samples: int = 10) -> float:
         """Run MC Dropout and return mean probability std as uncertainty."""
