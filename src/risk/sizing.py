@@ -8,9 +8,7 @@ All sizers return a notional amount (in quote currency) for a given trade.
 from __future__ import annotations
 
 import logging
-import math
 from abc import ABC, abstractmethod
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 

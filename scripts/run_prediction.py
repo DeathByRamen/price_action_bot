@@ -23,7 +23,7 @@ import yaml
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.pipeline import run_pipeline, run_multi_timeframe_pipeline
+from src.pipeline import run_multi_timeframe_pipeline, run_pipeline
 
 
 def load_config(path: str) -> dict:

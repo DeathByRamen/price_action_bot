@@ -7,7 +7,7 @@ Tracks open/closed positions, P&L, equity curve, and exposure over time.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from .costs import TransactionCosts

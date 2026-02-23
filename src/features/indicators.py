@@ -15,10 +15,10 @@ import logging
 
 import numpy as np
 import pandas as pd
-from ta.momentum import RSIIndicator, StochRSIIndicator, WilliamsRIndicator, ROCIndicator
-from ta.trend import MACD, EMAIndicator, ADXIndicator
-from ta.volatility import BollingerBands, AverageTrueRange, KeltnerChannel
-from ta.volume import OnBalanceVolumeIndicator, AccDistIndexIndicator
+from ta.momentum import ROCIndicator, RSIIndicator, StochRSIIndicator, WilliamsRIndicator
+from ta.trend import MACD, ADXIndicator, EMAIndicator
+from ta.volatility import AverageTrueRange, BollingerBands, KeltnerChannel
+from ta.volume import AccDistIndexIndicator, OnBalanceVolumeIndicator
 
 logger = logging.getLogger(__name__)
 
@@ -180,12 +180,12 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 def get_feature_columns() -> list[str]:
     """Return the ordered list of all feature column names used as model features."""
-    from src.features.orderbook import get_orderbook_feature_columns
     from src.features.derivatives import (
         get_coinalyze_feature_columns,
-        get_funding_rate_feature_columns,
         get_cross_asset_feature_columns,
+        get_funding_rate_feature_columns,
     )
+    from src.features.orderbook import get_orderbook_feature_columns
 
     return [
         # Trend (price-relative)

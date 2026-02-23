@@ -8,7 +8,7 @@ SignalGenerator, and simulates trades with realistic transaction costs.
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd

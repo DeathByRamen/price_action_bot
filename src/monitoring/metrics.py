@@ -21,7 +21,6 @@ try:
         Counter,
         Gauge,
         Histogram,
-        Summary,
         start_http_server,
     )
     HAS_PROMETHEUS = True

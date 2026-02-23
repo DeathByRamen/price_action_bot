@@ -9,7 +9,6 @@ torch = pytest.importorskip("torch")
 from src.model.ensemble import (
     _combine_probs_log_odds,
     combine_predictions,
-    MultiTimeframePrediction,
     format_multi_timeframe_message,
 )
 from src.model.predictor import Prediction

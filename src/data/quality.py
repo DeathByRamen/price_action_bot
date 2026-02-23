@@ -8,8 +8,8 @@ and the daily retrain digest (quality reporting).
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Tuple
+from datetime import timedelta
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd

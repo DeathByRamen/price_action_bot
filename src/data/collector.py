@@ -10,7 +10,7 @@ import asyncio
 import logging
 from typing import List, Optional
 
-from src.api.bitunix_client import BitunixClient, Candle, Ticker
+from src.api.bitunix_client import BitunixClient, Candle
 from src.data.quality import validate_candles
 from src.data.storage import Storage
 
@@ -173,7 +173,7 @@ class DataCollector:
 
             earliest_ts = candles[0].ts
             try:
-                from datetime import datetime, timezone
+                from datetime import datetime
 
                 dt = datetime.fromisoformat(earliest_ts.replace("Z", "+00:00"))
                 end_time = int(dt.timestamp())

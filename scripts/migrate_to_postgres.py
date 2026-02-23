@@ -20,6 +20,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
 import aiosqlite
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 async def migrate(sqlite_path: str, pg_dsn: str) -> None:
     """Migrate all tables from SQLite to PostgreSQL."""
     try:
-        import asyncpg
+        import asyncpg  # noqa: F401
     except ImportError:
         logger.error("asyncpg not installed — pip install asyncpg")
         return

@@ -11,6 +11,12 @@ line-length = 100
 select = ["E", "F", "W", "I"]
 ignore = ["E501"]
 
+[tool.ruff.lint.per-file-ignores]
+"scripts/*.py" = ["E402"]
+"src/pipeline.py" = ["E402"]
+"src/model/gbm.py" = ["E402"]
+"tests/*.py" = ["E402"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

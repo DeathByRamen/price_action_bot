@@ -2,10 +2,6 @@
 
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
-import pytest
-
 from src.features.indicators import (
     MAX_WARMUP_PERIODS,
     check_feature_correlation,

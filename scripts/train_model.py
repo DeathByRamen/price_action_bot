@@ -14,7 +14,7 @@ import os
 import shutil
 import sys
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional
+from typing import Dict
 
 import numpy as np
 import pandas as pd
@@ -23,15 +23,15 @@ import torch
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.data.storage import Storage
-from src.features.indicators import compute_indicators, get_feature_columns
-from src.features.orderbook import compute_orderbook_features
 from src.features.derivatives import (
     compute_coinalyze_features,
-    compute_funding_rate_features,
     compute_cross_asset_features,
+    compute_funding_rate_features,
 )
+from src.features.indicators import compute_indicators, get_feature_columns
+from src.features.orderbook import compute_orderbook_features
 from src.model.dataset import walk_forward_split
-from src.model.trainer import Trainer, DEFAULT_CHECKPOINT_DIR
+from src.model.trainer import DEFAULT_CHECKPOINT_DIR, Trainer
 
 
 async def load_training_data(

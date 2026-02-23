@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Optional
 
 import numpy as np
 import pandas as pd

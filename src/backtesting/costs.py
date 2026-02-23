@@ -6,8 +6,7 @@ Models maker/taker fees, funding rate costs, and slippage estimation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 
 @dataclass

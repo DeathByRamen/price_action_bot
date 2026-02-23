@@ -18,7 +18,8 @@ import numpy as np
 import pandas as pd
 import torch
 
-from src.features.indicators import compute_indicators, get_feature_columns, MAX_WARMUP_PERIODS
+from src.features.indicators import MAX_WARMUP_PERIODS, compute_indicators, get_feature_columns
+
 from .architecture import CryptoPredictorLSTM
 
 logger = logging.getLogger(__name__)

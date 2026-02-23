@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -10,11 +9,10 @@ torch = pytest.importorskip("torch")
 
 from src.features.indicators import compute_indicators, get_feature_columns
 from src.model.dataset import (
-    CryptoTimeSeriesDataset,
-    LABEL_UP,
-    LABEL_FLAT,
     LABEL_DOWN,
-    DEFAULT_FLAT_THRESHOLD,
+    LABEL_FLAT,
+    LABEL_UP,
+    CryptoTimeSeriesDataset,
 )
 
 

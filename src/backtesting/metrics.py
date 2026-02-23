@@ -8,8 +8,8 @@ and other standard quant metrics from an equity curve and trade log.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 
@@ -160,7 +160,6 @@ def compute_metrics(
         report.losing_trades = len(losers)
         report.win_rate = (len(winners) / len(trade_log)) * 100 if trade_log else 0.0
 
-        notionals = [t.get("notional", 1) for t in trade_log]
         if winners:
             win_notionals = [
                 t.get("notional", 1) for t in trade_log if t.get("net_pnl", 0) > 0
@@ -173,7 +172,7 @@ def compute_metrics(
                 t.get("notional", 1) for t in trade_log if t.get("net_pnl", 0) <= 0
             ]
             report.avg_loss_pct = float(
-                np.mean([l / n * 100 for l, n in zip(losers, loss_notionals)])
+                np.mean([loss / n * 100 for loss, n in zip(losers, loss_notionals)])
             )
 
         gross_profit = sum(winners) if winners else 0

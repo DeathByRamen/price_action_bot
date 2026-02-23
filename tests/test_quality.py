@@ -6,13 +6,12 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from src.data.quality import (
+    check_training_data_quality,
     detect_gaps,
     has_timestamp_gap_in_window,
     validate_candles,
-    check_training_data_quality,
 )
 
 

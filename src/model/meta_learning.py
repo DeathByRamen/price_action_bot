@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -170,7 +170,7 @@ class MetaLearner:
         self._cluster_labels = {sym: int(lbl) for sym, lbl in zip(symbols, labels)}
 
         for cluster_id in range(n_clusters):
-            cluster_syms = [s for s, l in self._cluster_labels.items() if l == cluster_id]
+            cluster_syms = [s for s, label in self._cluster_labels.items() if label == cluster_id]
             logger.info("Cluster %d: %d symbols — %s",
                         cluster_id, len(cluster_syms), cluster_syms[:5])
 

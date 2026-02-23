@@ -8,8 +8,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from src.model.predictor import Predictor, _compute_signal_score, DIRECTION_LABELS
 from src.features.indicators import get_feature_columns
+from src.model.predictor import Predictor, _compute_signal_score
 
 
 class TestComputeSignalScore:

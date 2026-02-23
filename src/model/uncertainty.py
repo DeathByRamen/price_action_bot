@@ -8,7 +8,7 @@ trades and improve risk-adjusted returns.
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 import torch

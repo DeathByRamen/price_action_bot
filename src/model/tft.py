@@ -11,11 +11,8 @@ Architecture:
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class GatedResidualNetwork(nn.Module):
@@ -80,7 +77,7 @@ class VariableSelectionNetwork(nn.Module):
         selected : (batch, seq_len, d_model)
         weights : (batch, seq_len, num_features)
         """
-        B, T, F = x.shape
+        B, T, N = x.shape
 
         transformed = []
         for i in range(self.num_features):

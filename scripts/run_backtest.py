@@ -13,15 +13,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import csv
 import logging
 import os
 import sys
-from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
 import numpy as np
@@ -29,10 +28,10 @@ import pandas as pd
 
 from src.backtesting.costs import TransactionCosts
 from src.backtesting.engine import Backtester
-from src.backtesting.metrics import PerformanceReport, compute_metrics
+from src.backtesting.metrics import PerformanceReport
 from src.backtesting.signals import PredictorSignalGenerator
 from src.data.storage import Storage
-from src.features.indicators import MAX_WARMUP_PERIODS, compute_indicators
+from src.features.indicators import MAX_WARMUP_PERIODS
 from src.model.predictor import Predictor
 
 logging.basicConfig(
@@ -49,8 +48,6 @@ async def load_data(
     min_candles: int = 500,
 ) -> dict[str, pd.DataFrame]:
     """Load historical OHLCV data from the database."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-
     symbols_df = await storage.db.execute_fetchall(
         "SELECT DISTINCT symbol FROM ohlcv WHERE interval = ?",
         (interval,),

@@ -6,7 +6,6 @@ Can be imported or run directly via `scripts/backfill_data.py`.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from src.api.bitunix_client import BitunixClient

@@ -10,11 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import hmac
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import aiohttp

@@ -182,7 +182,7 @@ class PostgresStorage:
             return 0
 
         async with self._pool.acquire() as conn:
-            result = await conn.executemany("""
+            await conn.executemany("""
                 INSERT INTO ohlcv (ts, symbol, interval, open, high, low, close, volume)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 ON CONFLICT (symbol, ts, interval) DO NOTHING

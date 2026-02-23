@@ -13,9 +13,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional
 
-import yaml
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -23,24 +22,24 @@ load_dotenv()
 from src.api.bitunix_client import BitunixClient
 from src.data.collector import DataCollector
 from src.data.storage import Storage
-from src.features.indicators import MAX_WARMUP_PERIODS
-from src.features.orderbook import compute_orderbook_features
 from src.features.derivatives import (
     compute_coinalyze_features,
-    compute_funding_rate_features,
     compute_cross_asset_features,
+    compute_funding_rate_features,
 )
-from src.model.predictor import Prediction, Predictor
+from src.features.indicators import MAX_WARMUP_PERIODS
+from src.features.orderbook import compute_orderbook_features
 from src.model.ensemble import (
     MultiTimeframePrediction,
     combine_timeframes,
     compute_adaptive_weights,
     format_multi_timeframe_message,
 )
-from src.notifications.dispatcher import Dispatcher, Notifier
+from src.model.predictor import Prediction, Predictor
 from src.notifications.discord_notifier import DiscordNotifier
-from src.notifications.telegram_notifier import TelegramNotifier
+from src.notifications.dispatcher import Dispatcher
 from src.notifications.email_notifier import EmailNotifier
+from src.notifications.telegram_notifier import TelegramNotifier
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +145,7 @@ async def run_pipeline(
 
         # 4. Load candles for all symbols, then enrich with OB/derivatives
         symbol_latest_ts: dict[str, str] = {}
-        symbol_dfs: dict[str, "pd.DataFrame"] = {}
+        symbol_dfs: dict[str, object] = {}
 
         btc_df = await storage.get_candles("BTCUSDT", limit=candle_limit, interval=interval)
 
@@ -318,7 +317,8 @@ async def run_multi_timeframe_pipeline(
     # Dispatch combined notifications
     dispatcher = build_dispatcher(config)
     if combined and dispatcher._channels:
-        from datetime import datetime, timezone as tz
+        from datetime import datetime
+        from datetime import timezone as tz
         now_utc = datetime.now(tz.utc).strftime("%Y-%m-%d %H:%M UTC")
         subject = (
             f"[PA Bot] Ensemble ({primary_interval}m + {secondary_interval}m) "
