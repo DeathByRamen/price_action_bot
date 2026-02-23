@@ -337,7 +337,7 @@ Add these lines at the bottom:
 # PA Bot: Hourly predictions (every hour at minute 5)
 5 * * * * cd /opt/pa_bot && /opt/pa_bot/venv/bin/python scripts/run_prediction.py --multi-timeframe >> logs/prediction.log 2>&1
 
-# PA Bot: Daily retrain (midnight UTC)
+# PA Bot: Daily retrain — LSTM + TFT + GBM for all timeframes (midnight UTC)
 0 0 * * * cd /opt/pa_bot && /opt/pa_bot/venv/bin/python scripts/daily_retrain.py >> logs/retrain.log 2>&1
 
 # PA Bot: Order book + funding rate snapshots (every 15 minutes)
@@ -345,6 +345,21 @@ Add these lines at the bottom:
 
 # PA Bot: Coinalyze OI + liquidations + L/S ratio (hourly at :10)
 10 * * * * cd /opt/pa_bot && /opt/pa_bot/venv/bin/python scripts/collect_coinalyze.py >> logs/coinalyze.log 2>&1
+
+# PA Bot: Sentiment — Fear & Greed + CryptoPanic news (hourly at :15)
+15 * * * * cd /opt/pa_bot && /opt/pa_bot/venv/bin/python scripts/collect_sentiment.py >> logs/sentiment.log 2>&1
+
+# PA Bot: Binance cross-exchange — funding rates + OI (hourly at :20)
+20 * * * * cd /opt/pa_bot && /opt/pa_bot/venv/bin/python scripts/collect_binance.py >> logs/binance.log 2>&1
+
+# PA Bot: Weekly HPO — Optuna hyperparameter optimization (Sunday 02:00 UTC)
+0 2 * * 0 cd /opt/pa_bot && /opt/pa_bot/venv/bin/python scripts/weekly_hpo.py >> logs/hpo.log 2>&1
+
+# PA Bot: Health check (every 30 minutes)
+*/30 * * * * cd /opt/pa_bot && /opt/pa_bot/venv/bin/python scripts/healthcheck.py --notify >> logs/health.log 2>&1
+
+# Log rotation (weekly, Sunday 06:00)
+0 6 * * 0 find /opt/pa_bot/logs -name "*.log" -size +50M -exec truncate -s 0 {} \;
 ```
 
 Save: `Ctrl+O`, `Enter`, `Ctrl+X`
@@ -359,10 +374,15 @@ crontab -l
 
 | Job | Schedule | Purpose |
 |---|---|---|
-| `run_prediction.py` | Every hour at :05 | Fetch candles, run models, send alerts |
-| `daily_retrain.py` | Midnight UTC daily | Score predictions, tune threshold, retrain model |
-| `collect_orderbook.py` | Every 15 minutes | Snapshot order book depth + funding rates for future feature extraction |
-| `collect_coinalyze.py` | Hourly at :10 | Coinalyze OI, liquidations, L/S ratio (15-min granularity) |
+| `run_prediction.py` | Every hour at :05 | Fetch candles, run all models, send alerts |
+| `daily_retrain.py` | Midnight UTC daily | Score predictions, tune threshold, retrain LSTM + TFT + GBM |
+| `collect_orderbook.py` | Every 15 minutes | Snapshot order book depth + funding rates |
+| `collect_coinalyze.py` | Hourly at :10 | Coinalyze OI, liquidations, L/S ratio |
+| `collect_sentiment.py` | Hourly at :15 | Fear & Greed Index + CryptoPanic news sentiment |
+| `collect_binance.py` | Hourly at :20 | Binance funding rates + open interest (cross-exchange) |
+| `weekly_hpo.py` | Sunday 02:00 UTC | Optuna hyperparameter optimization for all 3 models |
+| `healthcheck.py` | Every 30 minutes | System health monitoring with email alerts |
+| Log rotation | Sunday 06:00 | Truncate logs over 50 MB |
 
 ### Why :05 and not :00?
 
@@ -480,14 +500,51 @@ When code changes are pushed to GitHub:
 cd /opt/pa_bot
 source venv/bin/activate
 git pull
-pip install -r requirements.txt  # only needed if dependencies changed
+pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
-If the model architecture or features changed, retrain:
+If the feature count or model architecture changed (check the error logs for
+`Checkpoint expects X features but model has Y`), you must delete old
+checkpoints and retrain:
 
 ```bash
-nohup python3 scripts/train_model.py --epochs 100 --window 168 --patience 10 --interval 60 > logs/train_60.log 2>&1 &
+# 1. Stop cron jobs while retraining
+crontab -l > /tmp/cron_backup.txt
+crontab -r
+
+# 2. Delete incompatible checkpoints
+rm -f data/models/model_final_*.pt
+rm -f data/models/model_final_*.pkl
+
+# 3. Seed new data sources (run each once)
+python scripts/collect_sentiment.py      # grabs ~10 days of Fear & Greed history
+python scripts/collect_binance.py        # grabs current Binance funding rates + OI
+
+# 4. Train LSTM for both timeframes
+nohup python scripts/train_model.py --epochs 100 --window 168 --patience 10 --interval 60 >> logs/train_60.log 2>&1 &
+# Wait for completion: tail -f logs/train_60.log
+# Then train 15m:
+nohup python scripts/train_model.py --epochs 100 --window 168 --patience 10 --interval 15 >> logs/train_15.log 2>&1 &
+# Wait for completion: tail -f logs/train_15.log
+
+# 5. Test a prediction
+python scripts/run_prediction.py --multi-timeframe
+
+# 6. Restore cron jobs (see Section 12 for full cron schedule)
+crontab /tmp/cron_backup.txt
+# Or set up fresh: crontab -e
 ```
+
+**Note:** `train_model.py` only trains the LSTM. The TFT and GBM models will
+be trained automatically on the next `daily_retrain.py` run (midnight UTC).
+Until then, predictions use the LSTM alone — the ensemble activates once
+TFT/GBM checkpoints exist.
+
+**Note:** New data sources (sentiment, Binance cross-exchange) won't have
+deep history on first deploy. The model handles this gracefully — those
+features default to `0.0`. After 1-2 weeks of hourly collection via cron,
+the daily retrain will start incorporating real sentiment and cross-exchange
+signal.
 
 Cron jobs pick up code changes automatically on the next run — no restart needed.
 
