@@ -42,25 +42,25 @@ class TestLogOddsCombination:
     def test_probabilities_sum_to_one(self):
         probs_a = [0.6, 0.2, 0.2]
         probs_b = [0.5, 0.3, 0.2]
-        combined = _combine_probs_log_odds(probs_a, probs_b, w_a=0.6, w_b=0.4)
+        combined = _combine_probs_log_odds(probs_a, probs_b, 0.6, 0.4)
         assert abs(sum(combined) - 1.0) < 1e-6
 
     def test_agreeing_signals_boost(self):
         probs_a = [0.7, 0.1, 0.2]
         probs_b = [0.8, 0.1, 0.1]
-        combined = _combine_probs_log_odds(probs_a, probs_b)
-        assert combined[0] > 0.7  # combined UP should be higher than either alone
+        combined = _combine_probs_log_odds(probs_a, probs_b, 0.5, 0.5)
+        assert combined[0] > 0.7
 
     def test_conflicting_signals(self):
         probs_a = [0.7, 0.1, 0.2]  # UP
         probs_b = [0.1, 0.1, 0.8]  # DOWN
-        combined = _combine_probs_log_odds(probs_a, probs_b, w_a=0.5, w_b=0.5)
+        combined = _combine_probs_log_odds(probs_a, probs_b, 0.5, 0.5)
         assert combined[0] < 0.7
         assert combined[2] < 0.8
 
     def test_equal_weights(self):
         probs = [0.5, 0.3, 0.2]
-        combined = _combine_probs_log_odds(probs, probs, w_a=0.5, w_b=0.5)
+        combined = _combine_probs_log_odds(probs, probs, 0.5, 0.5)
         for i in range(3):
             assert abs(combined[i] - probs[i]) < 0.05
 
