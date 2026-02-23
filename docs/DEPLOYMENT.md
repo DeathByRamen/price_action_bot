@@ -1,703 +1,358 @@
-# PA Bot — Production Deployment Guide (Hetzner)
+# PA Bot — Production Deployment Guide
 
-This guide covers every step to take the PA Bot from a local development setup to a fully running production system on a Hetzner Cloud VPS.
-
----
-
-## Table of Contents
-
-1. [Prerequisites](#1-prerequisites)
-2. [Create the Hetzner Server](#2-create-the-hetzner-server)
-3. [Connect via SSH](#3-connect-via-ssh)
-4. [Set Up SSH Key Authentication (Optional)](#4-set-up-ssh-key-authentication-optional)
-5. [Install System Dependencies](#5-install-system-dependencies)
-6. [Clone the Repository](#6-clone-the-repository)
-7. [Set Up Python Environment](#7-set-up-python-environment)
-8. [Configure Environment Variables](#8-configure-environment-variables)
-9. [Run the Backfill](#9-run-the-backfill)
-10. [Train the Models](#10-train-the-models)
-11. [Test a Prediction Run](#11-test-a-prediction-run)
-12. [Set Up Cron Jobs](#12-set-up-cron-jobs)
-13. [Verify Everything Is Running](#13-verify-everything-is-running)
-14. [Maintenance & Operations](#14-maintenance--operations)
-15. [Updating the Bot](#15-updating-the-bot)
-16. [Troubleshooting](#16-troubleshooting)
+Complete instructions for deploying to a Hetzner Cloud VPS.
+Covers fresh install and code updates.
 
 ---
 
-## 1. Prerequisites
+## Fresh Install
 
-Before you begin, make sure you have:
+### 1. Create Server
 
-- A **Hetzner Cloud account** — sign up at [https://console.hetzner.cloud](https://console.hetzner.cloud)
-- A **GitHub account** with access to the `price_action_bot` repository
-- A **GitHub Personal Access Token** (PAT) for cloning private repos — [create one here](https://github.com/settings/tokens) with `repo` scope
-- Your **notification credentials** ready:
-  - Email: Gmail address + App Password ([create one here](https://myaccount.google.com/apppasswords))
-  - Discord: Webhook URL (optional)
-  - Telegram: Bot token + chat ID (optional)
+1. [Hetzner Cloud Console](https://console.hetzner.cloud) → **Add Server**
+2. Ubuntu 24.04 / **CX22** (2 vCPU, 4 GB RAM, ~$4.50/mo) / Ashburn or nearest
+3. Note the **IP address** and check email for **root password**
 
----
-
-## 2. Create the Hetzner Server
-
-1. Log into [Hetzner Cloud Console](https://console.hetzner.cloud)
-2. Click **Add Server**
-3. Configure:
-
-| Setting | Value |
-|---|---|
-| **Location** | Ashburn (US) or nearest to you |
-| **Image** | Ubuntu 24.04 |
-| **Type** | Shared vCPU > **CX22** (2 vCPU, 4 GB RAM) |
-| **SSH Key** | Add one if you have it, or skip for password access |
-| **Name** | `pa-bot` |
-
-4. Click **Create & Buy Now** (~$4.50/month)
-5. Note the **Public IP address** once it's running
-6. If you skipped SSH key setup, check your email for the **root password**
-
----
-
-## 3. Connect via SSH
-
-Open a terminal (PowerShell on Windows, Terminal on Mac/Linux):
+### 2. Server Setup
 
 ```bash
 ssh root@YOUR_SERVER_IP
-```
 
-- If it asks about authenticity, type `yes`
-- Enter the root password from the Hetzner email
-- Nothing appears on screen while typing the password — this is normal
-
-You should now see a prompt like `root@pa-bot:~#`.
-
----
-
-## 4. Set Up SSH Key Authentication (Optional)
-
-This lets you SSH in without a password every time.
-
-### On your local machine:
-
-**Windows (PowerShell):**
-
-```powershell
-# Check if you already have a key
-Get-Content "$env:USERPROFILE\.ssh\id_ed25519.pub"
-
-# If the file doesn't exist, generate one:
-ssh-keygen -t ed25519
-# Press Enter for all prompts (default location, no passphrase)
-
-# Then read the public key:
-Get-Content "$env:USERPROFILE\.ssh\id_ed25519.pub"
-```
-
-**Mac/Linux:**
-
-```bash
-# Check if you already have a key
-cat ~/.ssh/id_ed25519.pub
-
-# If the file doesn't exist, generate one:
-ssh-keygen -t ed25519
-# Press Enter for all prompts
-
-# Then read the public key:
-cat ~/.ssh/id_ed25519.pub
-```
-
-Copy the entire output (starts with `ssh-ed25519`).
-
-### On the server:
-
-```bash
-mkdir -p ~/.ssh
-echo "PASTE_YOUR_PUBLIC_KEY_HERE" >> ~/.ssh/authorized_keys
-chmod 700 ~/.ssh
-chmod 600 ~/.ssh/authorized_keys
-```
-
-Replace `PASTE_YOUR_PUBLIC_KEY_HERE` with your actual public key.
-
-Test from a new terminal: `ssh root@YOUR_SERVER_IP` — should log in without a password.
-
----
-
-## 5. Install System Dependencies
-
-On the server:
-
-```bash
+# System packages
 apt update && apt upgrade -y
 apt install -y python3 python3-pip python3-venv git sqlite3
-```
 
-Verify Python:
-
-```bash
-python3 --version
-# Should show Python 3.12.x or similar
-```
-
----
-
-## 6. Clone the Repository
-
-```bash
+# Clone repo
 cd /opt
 git clone https://github.com/DeathByRamen/price_action_bot.git pa_bot
-```
-
-When prompted:
-- **Username:** Your GitHub username
-- **Password:** Your GitHub Personal Access Token (NOT your GitHub password)
-
-Save the token for future pulls:
-
-```bash
 cd /opt/pa_bot
 git config credential.helper store
-```
 
-The next time you `git pull`, it will save your credentials so you don't have to re-enter them.
-
----
-
-## 7. Set Up Python Environment
-
-```bash
-cd /opt/pa_bot
+# Python environment
 python3 -m venv venv
 source venv/bin/activate
-```
-
-Install PyTorch (CPU version) and all dependencies:
-
-```bash
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
 ```
 
-This takes a few minutes. Verify when done:
-
-```bash
-python3 -c "import torch; print('PyTorch:', torch.__version__)"
-python3 -c "from src.features.indicators import get_feature_columns; print('Features:', len(get_feature_columns()))"
-```
-
-Expected output:
-
-```
-PyTorch: 2.10.0+cpu
-Features: 41
-```
-
----
-
-## 8. Configure Environment Variables
-
-Create the `.env` file:
+### 3. Environment Variables
 
 ```bash
 nano /opt/pa_bot/.env
 ```
 
-Paste your credentials:
+Paste (only include channels you use):
 
 ```
-SMTP_PASSWORD=your_gmail_app_password_here
-DISCORD_WEBHOOK_URL=your_discord_webhook_here
-TELEGRAM_BOT_TOKEN=your_telegram_token_here
-TELEGRAM_CHAT_ID=your_telegram_chat_id_here
+SMTP_PASSWORD=your_gmail_app_password
+COINALYZE_API_KEY=your_coinalyze_key
+CRYPTOPANIC_API_KEY=your_cryptopanic_key
+DISCORD_WEBHOOK_URL=your_discord_webhook
+TELEGRAM_BOT_TOKEN=your_telegram_token
+TELEGRAM_CHAT_ID=your_telegram_chat_id
 ```
 
-Only include the lines for channels you're using. At minimum you need `SMTP_PASSWORD` for email notifications.
+At minimum you need `SMTP_PASSWORD`. Save with `Ctrl+O`, `Enter`, `Ctrl+X`.
 
-Save: `Ctrl+O`, `Enter`, `Ctrl+X`
-
-Verify the config is correct:
+### 4. Backfill Historical Data
 
 ```bash
-python3 -c "
-from dotenv import load_dotenv; load_dotenv()
-import os
-print('SMTP:', 'SET' if os.getenv('SMTP_PASSWORD') else 'MISSING')
-"
-```
-
----
-
-## 9. Run the Backfill
-
-Create a logs directory and run the backfill in the background:
-
-```bash
+cd /opt/pa_bot && source venv/bin/activate
 mkdir -p logs
-nohup python3 scripts/backfill_data.py --all-timeframes > logs/backfill.log 2>&1 &
+
+# OHLCV candles (30-60 min, rate-limited)
+nohup python scripts/backfill_data.py --all-timeframes >> logs/backfill.log 2>&1 &
+tail -f logs/backfill.log  # Ctrl+C to stop watching
+
+# Coinalyze derivatives (OI, liquidations, L/S ratio)
+nohup python scripts/backfill_coinalyze.py >> logs/backfill_coinalyze.log 2>&1 &
+tail -f logs/backfill_coinalyze.log
 ```
 
-Monitor progress:
+Wait for both to finish, then seed the new sources:
 
 ```bash
-tail -f logs/backfill.log
+python scripts/collect_sentiment.py    # ~10 days of Fear & Greed
+python scripts/collect_binance.py      # current Binance snapshot (may fail if geo-blocked — not critical)
+python scripts/collect_orderbook.py    # first order book + funding rate snapshot
 ```
 
-Press `Ctrl+C` to stop watching (the backfill continues in the background).
-
-**Expected duration:** 30-60 minutes (API rate-limited).
-**Expected result:** ~862,000 candle rows across ~431 symbols at 1h and 15m intervals.
-
-Check if it's still running:
+### 5. Verify Data Before Training
 
 ```bash
-ps aux | grep backfill
+sqlite3 data/ohlcv.db <<'SQLEOF'
+.headers on
+.mode column
+SELECT 'ohlcv' AS tbl, COUNT(*) AS rows FROM ohlcv
+UNION ALL SELECT 'coinalyze_oi', COUNT(*) FROM coinalyze_oi
+UNION ALL SELECT 'coinalyze_liq', COUNT(*) FROM coinalyze_liquidations
+UNION ALL SELECT 'coinalyze_ls', COUNT(*) FROM coinalyze_long_short
+UNION ALL SELECT 'order_book', COUNT(*) FROM order_book_snapshots
+UNION ALL SELECT 'funding_rate', COUNT(*) FROM funding_rate_snapshots
+UNION ALL SELECT 'fear_greed', COUNT(*) FROM fear_greed_index
+UNION ALL SELECT 'predictions', COUNT(*) FROM predictions;
+
+SELECT 'close<=0' AS issue, COUNT(*) FROM ohlcv WHERE close <= 0
+UNION ALL SELECT 'high<low', COUNT(*) FROM ohlcv WHERE high < low
+UNION ALL SELECT 'duplicates', COUNT(*) FROM (
+    SELECT symbol, ts, interval, COUNT(*) AS c FROM ohlcv GROUP BY symbol, ts, interval HAVING c > 1);
+
+SELECT interval, COUNT(DISTINCT symbol) AS symbols, COUNT(*) AS rows,
+       MIN(ts) AS earliest, MAX(ts) AS latest FROM ohlcv GROUP BY interval;
+SQLEOF
 ```
 
-Check the database after completion:
+**Expected:** OHLCV has 200k+ rows, Coinalyze tables populated, zero bad candles, zero duplicates.
+
+### 6. Train Models
+
+`train_model.py` trains the **LSTM only**. TFT and GBM are trained by `daily_retrain.py`.
 
 ```bash
-sqlite3 data/ohlcv.db "SELECT interval, COUNT(*) FROM ohlcv GROUP BY interval;"
+# Train 1h model (10-20 min)
+nohup python scripts/train_model.py --epochs 100 --window 168 --patience 10 --interval 60 >> logs/train_60.log 2>&1 &
+tail -f logs/train_60.log
+# Wait for "Training complete" message
+
+# Train 15m model (10-20 min)
+nohup python scripts/train_model.py --epochs 100 --window 168 --patience 10 --interval 15 >> logs/train_15.log 2>&1 &
+tail -f logs/train_15.log
+
+# Verify checkpoints exist
+ls -la data/models/model_final_*.pt
 ```
 
----
-
-## 10. Train the Models
-
-### Train the 1h model:
+### 7. Test Prediction
 
 ```bash
-cd /opt/pa_bot
-source venv/bin/activate
-nohup python3 scripts/train_model.py --epochs 100 --window 168 --patience 10 --interval 60 > logs/train_60.log 2>&1 &
+python scripts/run_prediction.py --multi-timeframe
 ```
 
-Monitor: `tail -f logs/train_60.log`
+Check your email for the alert. If it arrives, everything works.
 
-**Expected duration:** 10-20 minutes.
-
-### Train the 15m model (after 1h finishes):
-
-```bash
-nohup python3 scripts/train_model.py --epochs 100 --window 672 --patience 10 --interval 15 > logs/train_15.log 2>&1 &
-```
-
-Monitor: `tail -f logs/train_15.log`
-
-### Verify models exist:
-
-```bash
-ls -la data/models/
-```
-
-You should see:
-
-```
-model_final_60.pt
-model_final_15.pt
-```
-
----
-
-## 11. Test a Prediction Run
-
-Run a single prediction cycle manually to verify everything works end-to-end:
-
-```bash
-cd /opt/pa_bot
-source venv/bin/activate
-python3 scripts/run_prediction.py --multi-timeframe
-```
-
-This should:
-- Fetch latest candles
-- Run both models
-- Combine predictions via ensemble
-- Send an email notification to your inbox
-
-Check your email. If you received the prediction alert, everything is working.
-
----
-
-## 12. Set Up Cron Jobs
-
-Open the crontab editor:
+### 8. Set Up Cron Jobs
 
 ```bash
 crontab -e
 ```
 
-If it asks which editor to use, select `1` (nano).
-
-Add these lines at the bottom:
+Select nano (option 1), paste this **entire block**:
 
 ```cron
-# PA Bot: Hourly predictions (every hour at minute 5)
+# Hourly predictions (at :05 to let candles finalize)
 5 * * * * cd /opt/pa_bot && /opt/pa_bot/venv/bin/python scripts/run_prediction.py --multi-timeframe >> logs/prediction.log 2>&1
 
-# PA Bot: Daily retrain — LSTM + TFT + GBM for all timeframes (midnight UTC)
+# Daily retrain — LSTM + TFT + GBM for all timeframes (midnight UTC)
 0 0 * * * cd /opt/pa_bot && /opt/pa_bot/venv/bin/python scripts/daily_retrain.py >> logs/retrain.log 2>&1
 
-# PA Bot: Order book + funding rate snapshots (every 15 minutes)
+# Order book + funding rate snapshots (every 15 min)
 */15 * * * * cd /opt/pa_bot && /opt/pa_bot/venv/bin/python scripts/collect_orderbook.py >> logs/orderbook.log 2>&1
 
-# PA Bot: Coinalyze OI + liquidations + L/S ratio (hourly at :10)
+# Coinalyze OI + liquidations + L/S ratio (hourly at :10)
 10 * * * * cd /opt/pa_bot && /opt/pa_bot/venv/bin/python scripts/collect_coinalyze.py >> logs/coinalyze.log 2>&1
 
-# PA Bot: Sentiment — Fear & Greed + CryptoPanic news (hourly at :15)
+# Sentiment — Fear & Greed + CryptoPanic news (hourly at :15)
 15 * * * * cd /opt/pa_bot && /opt/pa_bot/venv/bin/python scripts/collect_sentiment.py >> logs/sentiment.log 2>&1
 
-# PA Bot: Binance cross-exchange — funding rates + OI (hourly at :20)
+# Binance cross-exchange — funding rates + OI (hourly at :20)
 20 * * * * cd /opt/pa_bot && /opt/pa_bot/venv/bin/python scripts/collect_binance.py >> logs/binance.log 2>&1
 
-# PA Bot: Weekly HPO — Optuna hyperparameter optimization (Sunday 02:00 UTC)
+# Weekly HPO — Optuna hyperparameter optimization (Sunday 02:00 UTC)
 0 2 * * 0 cd /opt/pa_bot && /opt/pa_bot/venv/bin/python scripts/weekly_hpo.py >> logs/hpo.log 2>&1
 
-# PA Bot: Health check (every 30 minutes)
+# Health check (every 30 min)
 */30 * * * * cd /opt/pa_bot && /opt/pa_bot/venv/bin/python scripts/healthcheck.py --notify >> logs/health.log 2>&1
 
-# Log rotation (weekly, Sunday 06:00)
+# Log rotation (Sunday 06:00)
 0 6 * * 0 find /opt/pa_bot/logs -name "*.log" -size +50M -exec truncate -s 0 {} \;
 ```
 
-Save: `Ctrl+O`, `Enter`, `Ctrl+X`
-
-Verify cron is set:
-
-```bash
-crontab -l
-```
-
-### What this does:
+Save: `Ctrl+O`, `Enter`, `Ctrl+X`. Verify: `crontab -l`.
 
 | Job | Schedule | Purpose |
-|---|---|---|
-| `run_prediction.py` | Every hour at :05 | Fetch candles, run all models, send alerts |
-| `daily_retrain.py` | Midnight UTC daily | Score predictions, tune threshold, retrain LSTM + TFT + GBM |
-| `collect_orderbook.py` | Every 15 minutes | Snapshot order book depth + funding rates |
-| `collect_coinalyze.py` | Hourly at :10 | Coinalyze OI, liquidations, L/S ratio |
-| `collect_sentiment.py` | Hourly at :15 | Fear & Greed Index + CryptoPanic news sentiment |
-| `collect_binance.py` | Hourly at :20 | Binance funding rates + open interest (cross-exchange) |
-| `weekly_hpo.py` | Sunday 02:00 UTC | Optuna hyperparameter optimization for all 3 models |
-| `healthcheck.py` | Every 30 minutes | System health monitoring with email alerts |
-| Log rotation | Sunday 06:00 | Truncate logs over 50 MB |
+|-----|----------|---------|
+| `run_prediction.py` | Hourly :05 | Run models, send alerts |
+| `daily_retrain.py` | Midnight | Score predictions, retrain LSTM + TFT + GBM |
+| `collect_orderbook.py` | Every 15 min | Order book depth + funding rates |
+| `collect_coinalyze.py` | Hourly :10 | OI, liquidations, L/S ratio |
+| `collect_sentiment.py` | Hourly :15 | Fear & Greed + news sentiment |
+| `collect_binance.py` | Hourly :20 | Cross-exchange funding rates + OI |
+| `weekly_hpo.py` | Sunday 02:00 | Hyperparameter optimization |
+| `healthcheck.py` | Every 30 min | System health + email alerts |
 
-### Why :05 and not :00?
+### 9. Verify
 
-The :05 offset gives the exchange a few minutes to finalize the candle data for the top of the hour. Running at exactly :00 might fetch an incomplete candle.
+Wait for the next hour, then:
+
+```bash
+tail -50 logs/prediction.log          # prediction ran?
+sqlite3 data/ohlcv.db "SELECT COUNT(*) FROM predictions;"  # predictions stored?
+crontab -l                            # cron configured?
+```
 
 ---
 
-## 13. Verify Everything Is Running
+## Updating After Code Changes
 
-### Check cron is executing:
+Run these steps **every time** you push code updates to GitHub.
 
-Wait for the next hour to pass, then:
-
-```bash
-tail -50 logs/prediction.log
-```
-
-You should see prediction output and an email should arrive.
-
-### Check the database is growing:
+### If features/model architecture did NOT change:
 
 ```bash
-sqlite3 data/ohlcv.db "SELECT COUNT(*) FROM predictions;"
-```
-
-This number should increase every hour.
-
-### Check system resources:
-
-```bash
-htop
-```
-
-Press `q` to exit. Memory usage should be well under 4 GB.
-
----
-
-## 14. Maintenance & Operations
-
-### View recent logs:
-
-```bash
-# Prediction logs
-tail -100 logs/prediction.log
-
-# Retrain logs
-tail -100 logs/retrain.log
-```
-
-### Check prediction accuracy:
-
-```bash
+ssh root@YOUR_SERVER_IP
 cd /opt/pa_bot && source venv/bin/activate
-sqlite3 data/ohlcv.db "
-SELECT date(scored_at) as day,
-       COUNT(*) as total,
-       SUM(was_correct) as correct,
-       ROUND(AVG(was_correct)*100, 1) as accuracy_pct
-FROM predictions
-WHERE was_correct IS NOT NULL
-GROUP BY day
-ORDER BY day DESC
-LIMIT 7;
-"
-```
-
-### View the SQLite database:
-
-```bash
-sqlite3 data/ohlcv.db
-```
-
-Useful queries:
-
-```sql
--- Table sizes
-SELECT 'ohlcv' as tbl, COUNT(*) FROM ohlcv
-UNION ALL SELECT 'predictions', COUNT(*) FROM predictions
-UNION ALL SELECT 'accuracy_log', COUNT(*) FROM accuracy_log;
-
--- Latest predictions
-SELECT symbol, direction, magnitude, signal_score
-FROM predictions ORDER BY id DESC LIMIT 20;
-
--- Model accuracy over time
-SELECT run_date, total_scored, direction_accuracy
-FROM accuracy_log ORDER BY run_date DESC LIMIT 14;
-```
-
-Type `.quit` to exit SQLite.
-
-### Log rotation (prevent logs from growing forever):
-
-```bash
-# Add to crontab (crontab -e):
-0 6 * * 0 find /opt/pa_bot/logs -name "*.log" -size +50M -exec truncate -s 0 {} \;
-```
-
-This clears logs over 50 MB every Sunday at 6 AM.
-
-### Database maintenance (monthly):
-
-```bash
-cd /opt/pa_bot && source venv/bin/activate
-sqlite3 data/ohlcv.db "VACUUM;"
-```
-
----
-
-## 15. Updating the Bot
-
-When code changes are pushed to GitHub:
-
-```bash
-cd /opt/pa_bot
-source venv/bin/activate
 git pull
 pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
-If the feature count or model architecture changed (check the error logs for
-`Checkpoint expects X features but model has Y`), you must delete old
-checkpoints and retrain:
+Cron picks up code changes automatically — no restart needed.
+
+### If features/model architecture DID change:
+
+You'll know because prediction logs show `Checkpoint expects X features but model has Y`.
 
 ```bash
-# 1. Stop cron jobs while retraining
+ssh root@YOUR_SERVER_IP
+cd /opt/pa_bot && source venv/bin/activate
+
+# 1. Stop cron
 crontab -l > /tmp/cron_backup.txt
 crontab -r
 
-# 2. Delete incompatible checkpoints
+# 2. Pull code and install deps
+git pull
+pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+
+# 3. Delete incompatible checkpoints and stale predictions
 rm -f data/models/model_final_*.pt
 rm -f data/models/model_final_*.pkl
+sqlite3 data/ohlcv.db "DELETE FROM predictions;"
 
-# 3. Seed new data sources (run each once)
-python scripts/collect_sentiment.py      # grabs ~10 days of Fear & Greed history
-python scripts/collect_binance.py        # grabs current Binance funding rates + OI
+# 4. Seed any new data sources
+python scripts/collect_sentiment.py
+python scripts/collect_binance.py
+python scripts/collect_orderbook.py
 
-# 4. Train LSTM for both timeframes
+# 5. Train LSTM for both timeframes
 nohup python scripts/train_model.py --epochs 100 --window 168 --patience 10 --interval 60 >> logs/train_60.log 2>&1 &
-# Wait for completion: tail -f logs/train_60.log
-# Then train 15m:
+tail -f logs/train_60.log
+# Wait for "Training complete", then:
 nohup python scripts/train_model.py --epochs 100 --window 168 --patience 10 --interval 15 >> logs/train_15.log 2>&1 &
-# Wait for completion: tail -f logs/train_15.log
+tail -f logs/train_15.log
 
-# 5. Test a prediction
+# 6. Test prediction
 python scripts/run_prediction.py --multi-timeframe
 
-# 6. Restore cron jobs (see Section 12 for full cron schedule)
+# 7. Restore cron
 crontab /tmp/cron_backup.txt
-# Or set up fresh: crontab -e
+crontab -l  # verify
 ```
 
-**Note:** `train_model.py` only trains the LSTM. The TFT and GBM models will
-be trained automatically on the next `daily_retrain.py` run (midnight UTC).
-Until then, predictions use the LSTM alone — the ensemble activates once
-TFT/GBM checkpoints exist.
+**Note:** `train_model.py` only trains the LSTM. TFT and GBM models are
+trained automatically by `daily_retrain.py` at midnight. Predictions use
+LSTM-only until those checkpoints exist, then the ensemble activates.
 
-**Note:** New data sources (sentiment, Binance cross-exchange) won't have
-deep history on first deploy. The model handles this gracefully — those
-features default to `0.0`. After 1-2 weeks of hourly collection via cron,
-the daily retrain will start incorporating real sentiment and cross-exchange
-signal.
-
-Cron jobs pick up code changes automatically on the next run — no restart needed.
+**Note:** New data sources won't have deep history on first deploy. Features
+default to `0.0` until the hourly cron collectors accumulate 1-2 weeks of
+data. The model handles this gracefully.
 
 ---
 
-## 16. Troubleshooting
+## Data Quality Check
 
-### "Permission denied" when SSH-ing
-
-```bash
-# Reset root password from Hetzner Cloud Console:
-# Server > Rescue tab > Reset Root Password
-```
-
-### Cron jobs not running
+Run before training or whenever you suspect issues:
 
 ```bash
-# Check cron service is running
-systemctl status cron
+sqlite3 data/ohlcv.db <<'SQLEOF'
+.headers on
+.mode column
 
-# Check cron logs
-grep CRON /var/log/syslog | tail -20
+-- Row counts
+SELECT 'ohlcv' AS tbl, COUNT(*) AS rows FROM ohlcv
+UNION ALL SELECT 'predictions', COUNT(*) FROM predictions
+UNION ALL SELECT 'coinalyze_oi', COUNT(*) FROM coinalyze_oi
+UNION ALL SELECT 'coinalyze_liq', COUNT(*) FROM coinalyze_liquidations
+UNION ALL SELECT 'coinalyze_ls', COUNT(*) FROM coinalyze_long_short
+UNION ALL SELECT 'order_book', COUNT(*) FROM order_book_snapshots
+UNION ALL SELECT 'funding_rate', COUNT(*) FROM funding_rate_snapshots
+UNION ALL SELECT 'fear_greed', COUNT(*) FROM fear_greed_index;
 
-# Common issue: venv not activated in cron
-# Make sure cron uses the full path: /opt/pa_bot/venv/bin/python
+-- Bad candles (all should be 0)
+SELECT 'close<=0' AS issue, COUNT(*) AS count FROM ohlcv WHERE close <= 0
+UNION ALL SELECT 'high<low', COUNT(*) FROM ohlcv WHERE high < low
+UNION ALL SELECT 'volume<0', COUNT(*) FROM ohlcv WHERE volume < 0
+UNION ALL SELECT 'duplicates', COUNT(*) FROM (
+    SELECT symbol, ts, interval, COUNT(*) AS c FROM ohlcv GROUP BY symbol, ts, interval HAVING c > 1);
+
+-- Data freshness
+SELECT 'ohlcv_60m' AS source, MAX(ts) AS latest,
+       ROUND((julianday('now') - julianday(MAX(ts))) * 24, 1) AS hours_ago
+    FROM ohlcv WHERE interval = '60'
+UNION ALL SELECT 'ohlcv_15m', MAX(ts),
+       ROUND((julianday('now') - julianday(MAX(ts))) * 24, 1) FROM ohlcv WHERE interval = '15'
+UNION ALL SELECT 'coinalyze', MAX(ts),
+       ROUND((julianday('now') - julianday(MAX(ts))) * 24, 1) FROM coinalyze_oi
+UNION ALL SELECT 'order_book', MAX(ts),
+       ROUND((julianday('now') - julianday(MAX(ts))) * 24, 1) FROM order_book_snapshots
+UNION ALL SELECT 'fear_greed', MAX(ts),
+       ROUND((julianday('now') - julianday(MAX(ts))) * 24, 1) FROM fear_greed_index;
+
+-- BTC candle gap check (expect ~48 for last 48h)
+SELECT COUNT(*) AS btc_60m_last_48h FROM ohlcv
+WHERE symbol = 'BTCUSDT' AND interval = '60' AND ts >= datetime('now', '-48 hours');
+SQLEOF
 ```
 
-### Out of memory during training
-
-```bash
-# Use less data and smaller batches
-python3 scripts/train_model.py --epochs 100 --window 168 --patience 10 --interval 60 --rolling-days 30 --batch-size 32
-```
-
-### API errors during backfill/prediction
-
-```bash
-# Check the logs for specific errors
-grep ERROR logs/prediction.log | tail -20
-
-# Common: "Parameter error" = symbol not available on spot API
-# The bot auto-filters these, but some slip through. Safe to ignore.
-```
-
-### Model checkpoint mismatch after code update
-
-```
-RuntimeError: Checkpoint expects 38 features but model has 41. Retrain required.
-```
-
-This means the feature set changed. Delete old checkpoints and retrain:
-
-```bash
-rm data/models/model_final_*.pt
-python3 scripts/train_model.py --epochs 100 --window 168 --patience 10 --interval 60
-python3 scripts/train_model.py --epochs 100 --window 672 --patience 10 --interval 15
-```
-
-### Server rebooted (Hetzner maintenance)
-
-Cron jobs survive reboots automatically. Check everything is running:
-
-```bash
-crontab -l                              # cron still configured?
-tail -5 logs/prediction.log             # last prediction ran when?
-sqlite3 data/ohlcv.db "SELECT MAX(ts) FROM ohlcv;"  # latest candle?
-```
+| Check | Healthy | Problem |
+|-------|---------|---------|
+| Bad candles | All 0 | Corrupt data — investigate |
+| Freshness | < 2 hours | > 24 hours = collection stopped |
+| BTC gap check | ~48 | < 40 = missing candles |
 
 ---
 
-## 17. Health Check Monitoring
+## Troubleshooting
 
-The health check script monitors critical system components and can send email alerts:
-
-```bash
-# Manual health check
-cd /opt/pa_bot && source venv/bin/activate
-python3 scripts/healthcheck.py
-
-# Add to cron for automated alerting (every 30 minutes):
-*/30 * * * * cd /opt/pa_bot && /opt/pa_bot/venv/bin/python scripts/healthcheck.py --notify >> logs/health.log 2>&1
-```
-
-What it checks:
-- Last prediction < 2 hours ago
-- Last retrain < 26 hours ago
-- Last order book snapshot < 20 minutes ago
-- Database size < 5 GB
-- Disk free space > 2 GB
-
----
-
-## 18. Docker Deployment (Alternative)
-
-For a containerized deployment with TimescaleDB and monitoring:
-
-```bash
-cd /opt/pa_bot
-
-# Set up environment
-cp .env.example .env
-nano .env  # fill in credentials + POSTGRES_PASSWORD
-
-# Start the full stack
-docker-compose up -d
-
-# Check container status
-docker-compose ps
-
-# View app logs
-docker-compose logs -f app
-```
-
-This starts: PA Bot app + TimescaleDB (PostgreSQL) + Prometheus + Grafana.
-
-Grafana is available at `http://YOUR_SERVER_IP:3000` (default password: admin).
-
----
-
-## 19. Running a Backtest
-
-Validate the model's performance on historical data:
-
-```bash
-cd /opt/pa_bot && source venv/bin/activate
-
-# Single-pass backtest (last 90 days)
-python3 scripts/run_backtest.py --interval 60 --days 90 --capital 10000
-
-# Walk-forward backtest (realistic out-of-sample evaluation)
-python3 scripts/run_backtest.py --walk-forward --folds 5
-```
+| Problem | Solution |
+|---------|----------|
+| `Checkpoint expects X features but model has Y` | Delete checkpoints + retrain (see update steps above) |
+| Cron not running | `systemctl status cron` / check `grep CRON /var/log/syslog \| tail -20` |
+| Out of memory | Add `--rolling-days 30 --batch-size 32` to train command |
+| Binance 451 error | Geo-blocked on your server's IP — not critical, those features stay 0.0 |
+| No email received | Check `SMTP_PASSWORD` in `.env` / check `logs/prediction.log` for errors |
+| SSH permission denied | Reset root password from Hetzner Console → Rescue tab |
+| Server rebooted | Cron survives reboots. Verify: `crontab -l` and `tail -5 logs/prediction.log` |
 
 ---
 
 ## Quick Reference
 
+```bash
+ssh root@YOUR_SERVER_IP
+cd /opt/pa_bot && source venv/bin/activate
+```
+
 | Task | Command |
-|---|---|
-| SSH into server | `ssh root@YOUR_SERVER_IP` |
-| Activate venv | `cd /opt/pa_bot && source venv/bin/activate` |
-| Check prediction logs | `tail -50 logs/prediction.log` |
-| Check retrain logs | `tail -50 logs/retrain.log` |
-| Check health | `python3 scripts/healthcheck.py` |
-| Manual prediction run | `python3 scripts/run_prediction.py --multi-timeframe` |
-| Manual retrain | `python3 scripts/daily_retrain.py` |
-| Run backtest | `python3 scripts/run_backtest.py --walk-forward` |
+|------|---------|
+| View prediction logs | `tail -50 logs/prediction.log` |
+| View retrain logs | `tail -50 logs/retrain.log` |
+| Manual prediction | `python scripts/run_prediction.py --multi-timeframe` |
+| Manual retrain | `python scripts/daily_retrain.py` |
+| Health check | `python scripts/healthcheck.py` |
 | Pull latest code | `git pull` |
-| View cron schedule | `crontab -l` |
-| Edit cron schedule | `crontab -e` |
-| Database shell | `sqlite3 data/ohlcv.db` |
-| Docker start | `docker-compose up -d` |
-| Docker logs | `docker-compose logs -f app` |
-| Check disk space | `df -h` |
-| Check memory usage | `free -h` |
-| Check running processes | `htop` |
+| View cron | `crontab -l` |
+| Edit cron | `crontab -e` |
+| DB shell | `sqlite3 data/ohlcv.db` |
+| Check disk | `df -h` |
+| Check memory | `free -h` |
+| Check processes | `htop` |
+| Weekly accuracy | See query below |
+
+```sql
+-- Weekly prediction accuracy
+SELECT date(scored_at) AS day, COUNT(*) AS total,
+       SUM(was_correct) AS correct,
+       ROUND(AVG(was_correct)*100, 1) AS pct
+FROM predictions WHERE was_correct IS NOT NULL
+GROUP BY day ORDER BY day DESC LIMIT 7;
+```
