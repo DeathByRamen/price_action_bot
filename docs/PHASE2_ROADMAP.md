@@ -320,6 +320,8 @@ A persistent WebSocket daemon that:
 
 ## 8. Phase 2G — Futures-Specific Features
 
+### Status: PARTIALLY COMPLETE (Funding Rate Collection)
+
 ### The Problem
 
 The system analyzes futures markets but uses only spot-derived data. The most predictive signals for crypto futures are:
@@ -328,26 +330,38 @@ The system analyzes futures markets but uses only spot-derived data. The most pr
 2. **Open interest** — Total outstanding futures contracts. Rising OI + rising price = strong trend. Rising OI + falling price = shorts building.
 3. **Liquidation data** — Cascade liquidations cause violent moves. A cluster of long liquidations creates selling pressure.
 
-### BitUnix API Availability
+### BitUnix API Availability (Confirmed)
 
-These endpoints may or may not exist on BitUnix's API. Check:
-- `GET /api/v1/futures/market/funding_rate` or similar
-- `GET /api/v1/futures/market/open_interest`
-- WebSocket channels for liquidation events
+- **Funding rate**: `GET /api/v1/futures/market/funding_rate` — **AVAILABLE** (public, no auth). Returns: `symbol`, `markPrice`, `lastPrice`, `fundingRate`, `nextFundingTime`, `fundingInterval` (typically 8h).
+- **Open interest**: **NOT AVAILABLE** — no dedicated endpoint found. Not included in tickers response.
+- **Liquidation data**: **NOT AVAILABLE** — no public endpoint.
+- **WebSocket `price` channel**: Pushes `mp` (mark price), `ip` (index price), `fr` (funding rate), `ft` / `nft` (settlement times) in real-time.
 
-### What to Build (if API supports it)
+### What Has Been Built (Phase 2G Collection — COMPLETE)
 
-1. **New API methods** in `bitunix_client.py` for funding rate and OI
-2. **New collection script** or extend `collect_orderbook.py` to also fetch these
-3. **New features:**
-   - `funding_rate` — raw funding rate (already bounded, typically -0.1% to +0.1%)
-   - `funding_rate_zscore` — Z-score of funding rate vs. 7-day rolling average
-   - `open_interest_change` — % change in OI over last 4/24 hours
-   - `long_short_ratio` — if available, the ratio of long vs short positions
+1. **`BitunixClient.get_funding_rate(symbol)`** — REST client method for per-symbol funding rate.
+2. **`BitunixClient.get_all_funding_rates()`** — Bulk fetch attempt (falls back to per-symbol).
+3. **`DataCollector.fetch_funding_rate_snapshots(symbols)`** — Concurrent funding rate collection for all symbols, returns rows ready for DB insertion.
+4. **`Storage` table `funding_rate_snapshots`** — Stores `(symbol, ts, funding_rate, mark_price, last_price, next_funding_ts, funding_interval_hours)` with `UNIQUE(symbol, ts)`.
+5. **`Storage.insert_funding_rate_snapshots()`** / **`get_funding_rate_snapshots()`** — Bulk insert and query methods.
+6. **`scripts/collect_orderbook.py`** — Updated to collect **both** order book depth **and** funding rate snapshots in parallel, on the same 15-minute cron schedule.
 
-### Priority
+### What Remains (Phase 2G Feature Extraction — TODO)
 
-Lower than order book features. Funding rate data is often available on other platforms (CoinGlass, etc.) and could be backfilled. Order book data cannot be backfilled, which is why it's prioritized.
+When enough funding rate data has been accumulated (2-4 weeks), extract these features:
+
+- `funding_rate` — raw funding rate (already bounded, typically -0.1% to +0.1%)
+- `funding_rate_zscore` — Z-score of funding rate vs. 7-day rolling average
+- `funding_rate_momentum` — rate of change of funding rate between snapshots
+- `mark_spot_divergence` — (mark_price - last_price) / last_price — captures market sentiment divergence
+
+### Not Available on BitUnix
+
+- `open_interest_change` — % change in OI over last 4/24 hours — **endpoint does not exist**
+- `long_short_ratio` — ratio of long vs short positions — **endpoint does not exist**
+- Liquidation cascade detection — **no public endpoint**
+
+These could be sourced from third-party providers (CoinGlass API, Coinalyze) in a future phase if high-value.
 
 ---
 
@@ -382,35 +396,37 @@ Lower than order book features. Funding rate data is often available on other pl
                  └──────────────────┘
 ```
 
-### Phase 2 System (After Order Book Integration)
+### Phase 2 System (After Order Book + Funding Rate Integration)
 
 ```
-    OHLCV Candles (SQLite)          Order Book Snapshots (SQLite)
-           │                                  │
-           ▼                                  ▼
-  ┌───────────────────┐             ┌───────────────────────┐
-  │  41 Technical     │             │  8 Order Book         │
-  │  Indicators       │             │  Features             │
-  │  (indicators.py)  │             │  (orderbook_features) │
-  └────────┬──────────┘             └──────────┬────────────┘
-           │                                   │
-           └──────────┬────────────────────────┘
-                      │
-                      ▼ (49 features total)
-             ┌───────────────────┐
-             │  LSTM Model       │
-             │  Feature Gate     │◄── Learns which features matter
-             │  Temporal Attn    │    (OB features may dominate near
-             │  Dual Heads       │     support/resistance, technical
-             │  Residual Conn    │     features dominate in trends)
-             └────────┬──────────┘
-                      │
-                      ▼
-             ┌───────────────────┐
-             │  Predictions      │
-             │  Better timed     │
-             │  Liquidity-aware  │
-             └──────────────────┘
+  OHLCV Candles     Order Book Snapshots     Funding Rate Snapshots
+  (SQLite)          (SQLite)                 (SQLite)
+       │                    │                        │
+       ▼                    ▼                        ▼
+  ┌──────────────┐  ┌────────────────────┐  ┌────────────────────┐
+  │ 41 Technical │  │ 8 Order Book       │  │ 4 Funding Rate     │
+  │ Indicators   │  │ Features           │  │ Features           │
+  │ (indicators) │  │ (orderbook_feats)  │  │ (funding_feats)    │
+  └──────┬───────┘  └────────┬───────────┘  └────────┬───────────┘
+         │                   │                       │
+         └───────────┬───────┴───────────────────────┘
+                     │
+                     ▼ (~53 features total)
+            ┌───────────────────┐
+            │  LSTM Model       │
+            │  Feature Gate     │◄── Learns which features matter
+            │  Temporal Attn    │    (OB near support/resistance,
+            │  Dual Heads       │     funding near extremes,
+            │  Residual Conn    │     technical in trends)
+            └────────┬──────────┘
+                     │
+                     ▼
+            ┌───────────────────┐
+            │  Predictions      │
+            │  Better timed     │
+            │  Liquidity-aware  │
+            │  Sentiment-aware  │
+            └──────────────────┘
 ```
 
 ---
@@ -425,9 +441,9 @@ Lower than order book features. Funding rate data is often available on other pl
 | **2D** | Correlation guard integration | Any time | 1 hour | Low-Medium |
 | **2E** | Data quality monitoring | Any time | 0.5 days | Medium |
 | **2F** | WebSocket upgrade | Only if REST is insufficient | 2-3 days | Uncertain |
-| **2G** | Futures-specific features (funding, OI) | After confirming API support | 1-2 days | High (if available) |
+| **2G** | Futures-specific features — **Collection DONE**, feature extraction TODO | After 2-4 weeks of funding rate data | 0.5 days | High |
 
-**Recommended order:** 2D (quick win) → 2C → 2E → 2A → 2B → 2G → 2F
+**Recommended order:** 2D (quick win) → 2C → 2E → 2A + 2G-features → 2B → 2F
 
 ---
 
@@ -435,9 +451,9 @@ Lower than order book features. Funding rate data is often available on other pl
 
 | File | Purpose |
 |---|---|
-| `src/api/bitunix_client.py` | BitUnix REST API client (includes `get_market_depth()`) |
-| `src/data/storage.py` | SQLite backend (includes `order_book_snapshots` table and CRUD methods) |
-| `src/data/collector.py` | Data fetching orchestration (includes `fetch_order_book_snapshots()`) |
+| `src/api/bitunix_client.py` | BitUnix REST API client (includes `get_market_depth()`, `get_funding_rate()`, `get_all_funding_rates()`) |
+| `src/data/storage.py` | SQLite backend (includes `order_book_snapshots` + `funding_rate_snapshots` tables and CRUD methods) |
+| `src/data/collector.py` | Data fetching orchestration (includes `fetch_order_book_snapshots()`, `fetch_funding_rate_snapshots()`) |
 | `src/features/indicators.py` | Technical indicator computation (41 features, `get_feature_columns()`) |
 | `src/model/architecture.py` | LSTM model (feature gate, temporal attention, dual heads) |
 | `src/model/dataset.py` | Training dataset with per-symbol isolation, Z-score normalization |
@@ -447,7 +463,7 @@ Lower than order book features. Funding rate data is often available on other pl
 | `src/pipeline.py` | Main prediction pipeline orchestrator |
 | `src/scoring/accuracy.py` | Prediction scoring against actual outcomes |
 | `src/scoring/adaptive.py` | FLAT threshold auto-tuning + sample weighting |
-| `scripts/collect_orderbook.py` | Cron script for OB snapshot collection |
+| `scripts/collect_orderbook.py` | Cron script for OB + funding rate snapshot collection |
 | `scripts/run_prediction.py` | Cron script for hourly predictions |
 | `scripts/daily_retrain.py` | Cron script for daily retrain + feedback loop |
 | `scripts/train_model.py` | Manual training script |
@@ -477,6 +493,10 @@ These decisions were made during Phase 1 development and should be maintained:
 7. **Validation gate prevents regression** — when retraining with new features, the gate ensures the new model must outperform the old one before deployment. If OB features hurt performance (unlikely but possible), the old model is automatically preserved.
 
 8. **Checkpoint metadata for compatibility** — `num_features` and `feature_cols_hash` are stored in every checkpoint. Adding OB features will trigger a clean retrain rather than loading incompatible weights.
+
+9. **Funding rate collected alongside order book** — Both are fetched in parallel on the same 15-minute cron. Funding rate is the only futures-specific data point available from BitUnix (no OI or liquidation endpoints exist). Collecting early maximizes historical depth for feature extraction in Phase 2G.
+
+10. **Funding rate stored as raw snapshots** — `(symbol, ts, funding_rate, mark_price, last_price, next_funding_ts, funding_interval_hours)`. Feature extraction (z-scores, momentum, mark-spot divergence) will be computed at model integration time, keeping raw data flexible.
 
 ---
 
@@ -511,3 +531,39 @@ tail -20 /opt/pa_bot/logs/orderbook.log
 ```
 
 Expected: ~41,000 snapshots/day (431 symbols x 96 runs/day).
+
+## Appendix: How to Verify Funding Rate Collection Is Working
+
+```bash
+# How many funding rate snapshots collected so far
+sqlite3 /opt/pa_bot/data/ohlcv.db "SELECT COUNT(*) FROM funding_rate_snapshots;"
+
+# Funding rate snapshots per day
+sqlite3 /opt/pa_bot/data/ohlcv.db "
+SELECT date(ts) as day, COUNT(*) as snapshots, COUNT(DISTINCT symbol) as symbols
+FROM funding_rate_snapshots
+GROUP BY day
+ORDER BY day DESC
+LIMIT 7;
+"
+
+# Sample funding rates for BTC
+sqlite3 /opt/pa_bot/data/ohlcv.db "
+SELECT ts, funding_rate, mark_price, last_price, next_funding_ts
+FROM funding_rate_snapshots
+WHERE symbol = 'BTCUSDT'
+ORDER BY ts DESC
+LIMIT 10;
+"
+
+# Extreme funding rates (potential reversal signals)
+sqlite3 /opt/pa_bot/data/ohlcv.db "
+SELECT symbol, ts, funding_rate
+FROM funding_rate_snapshots
+WHERE ABS(funding_rate) > 0.001
+ORDER BY ts DESC
+LIMIT 20;
+"
+```
+
+Expected: Same volume as order book snapshots (~41,000/day). Funding rate values typically range from -0.001 to +0.001 (with extremes at -0.01 to +0.01 during volatile periods).

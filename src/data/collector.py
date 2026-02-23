@@ -313,6 +313,81 @@ class DataCollector:
         return rows
 
     # ------------------------------------------------------------------
+    # Funding rate snapshots
+    # ------------------------------------------------------------------
+    async def fetch_funding_rate_snapshots(
+        self,
+        symbols: List[str],
+        concurrency: int = 8,
+    ) -> List[tuple]:
+        """
+        Fetch current funding rate for all futures symbols and return rows
+        ready for ``storage.insert_funding_rate_snapshots()``.
+
+        Each row: (symbol, ts, funding_rate, mark_price, last_price,
+                   next_funding_ts, funding_interval_hours)
+        """
+        from datetime import datetime, timezone
+
+        semaphore = asyncio.Semaphore(concurrency)
+        ts_now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        rows: List[tuple] = []
+        errors = 0
+
+        async def _fetch_one(symbol: str) -> Optional[tuple]:
+            async with semaphore:
+                try:
+                    data = await self.client.get_funding_rate(symbol)
+                    if not data:
+                        return None
+
+                    funding_rate = float(data.get("fundingRate", 0))
+                    mark_price = float(data.get("markPrice", 0))
+                    last_price = float(data.get("lastPrice", 0))
+                    next_funding_time = data.get("nextFundingTime")
+                    funding_interval = int(data.get("fundingInterval", 8))
+
+                    next_ts = None
+                    if next_funding_time:
+                        try:
+                            nft = int(next_funding_time)
+                            next_ts = datetime.fromtimestamp(
+                                nft / 1000, tz=timezone.utc
+                            ).strftime("%Y-%m-%dT%H:%M:%S")
+                        except (ValueError, TypeError):
+                            next_ts = str(next_funding_time)
+
+                    return (
+                        symbol,
+                        ts_now,
+                        funding_rate,
+                        mark_price,
+                        last_price,
+                        next_ts,
+                        funding_interval,
+                    )
+                except Exception as exc:
+                    logger.debug("Funding rate fetch failed for %s: %s", symbol, exc)
+                    return None
+
+        results = await asyncio.gather(
+            *[_fetch_one(s) for s in symbols], return_exceptions=True
+        )
+
+        for sym, res in zip(symbols, results):
+            if isinstance(res, Exception):
+                errors += 1
+                logger.debug("Funding rate error for %s: %s", sym, res)
+            elif res is not None:
+                rows.append(res)
+
+        logger.info(
+            "Funding rate snapshots: %d collected, %d failed out of %d symbols",
+            len(rows), errors, len(symbols),
+        )
+        return rows
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
     @staticmethod

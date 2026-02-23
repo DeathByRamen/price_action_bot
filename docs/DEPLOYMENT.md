@@ -340,7 +340,7 @@ Add these lines at the bottom:
 # PA Bot: Daily retrain (midnight UTC)
 0 0 * * * cd /opt/pa_bot && /opt/pa_bot/venv/bin/python scripts/daily_retrain.py >> logs/retrain.log 2>&1
 
-# PA Bot: Order book snapshots (every 15 minutes)
+# PA Bot: Order book + funding rate snapshots (every 15 minutes)
 */15 * * * * cd /opt/pa_bot && /opt/pa_bot/venv/bin/python scripts/collect_orderbook.py >> logs/orderbook.log 2>&1
 ```
 
@@ -358,7 +358,7 @@ crontab -l
 |---|---|---|
 | `run_prediction.py` | Every hour at :05 | Fetch candles, run models, send alerts |
 | `daily_retrain.py` | Midnight UTC daily | Score predictions, tune threshold, retrain model |
-| `collect_orderbook.py` | Every 15 minutes | Snapshot order book depth for future feature extraction |
+| `collect_orderbook.py` | Every 15 minutes | Snapshot order book depth + funding rates for future feature extraction |
 
 ### Why :05 and not :00?
 

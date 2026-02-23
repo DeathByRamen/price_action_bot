@@ -115,6 +115,21 @@ CREATE TABLE IF NOT EXISTS order_book_snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ob_sym_ts ON order_book_snapshots(symbol, ts);
+
+CREATE TABLE IF NOT EXISTS funding_rate_snapshots (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol          TEXT    NOT NULL,
+    ts              TEXT    NOT NULL,
+    funding_rate    REAL    NOT NULL,
+    mark_price      REAL,
+    last_price      REAL,
+    next_funding_ts TEXT,
+    funding_interval_hours INTEGER DEFAULT 8,
+    created_at      TEXT    DEFAULT (datetime('now')),
+    UNIQUE(symbol, ts)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fr_sym_ts ON funding_rate_snapshots(symbol, ts);
 """
 
 MIGRATION_SQL = """
@@ -758,3 +773,63 @@ class Storage:
                 "SELECT COUNT(*) FROM order_book_snapshots"
             )
         return rows[0][0]
+
+    # ------------------------------------------------------------------
+    # Funding rate snapshot operations
+    # ------------------------------------------------------------------
+    async def insert_funding_rate_snapshots(self, rows: List[Tuple]) -> int:
+        """
+        Bulk-insert funding rate snapshots.
+        Each row: (symbol, ts, funding_rate, mark_price, last_price,
+                   next_funding_ts, funding_interval_hours)
+        Duplicates on (symbol, ts) are silently ignored.
+        Returns the number of rows inserted.
+        """
+        assert self._db is not None
+        sql = """
+            INSERT OR IGNORE INTO funding_rate_snapshots
+                (symbol, ts, funding_rate, mark_price, last_price,
+                 next_funding_ts, funding_interval_hours)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """
+        cursor = await self._db.executemany(sql, rows)
+        await self._db.commit()
+        return cursor.rowcount
+
+    async def get_funding_rate_snapshots(
+        self,
+        symbol: str,
+        start_ts: Optional[str] = None,
+        end_ts: Optional[str] = None,
+        limit: int = 1000,
+    ) -> pd.DataFrame:
+        """Return funding rate snapshots for a symbol within a time range."""
+        assert self._db is not None
+        conditions = ["symbol = ?"]
+        params: list = [symbol]
+
+        if start_ts:
+            conditions.append("ts >= ?")
+            params.append(start_ts)
+        if end_ts:
+            conditions.append("ts <= ?")
+            params.append(end_ts)
+
+        where = " AND ".join(conditions)
+        params.append(limit)
+        sql = f"""
+            SELECT symbol, ts, funding_rate, mark_price, last_price,
+                   next_funding_ts, funding_interval_hours, created_at
+            FROM funding_rate_snapshots
+            WHERE {where}
+            ORDER BY ts DESC
+            LIMIT ?
+        """
+        rows = await self._db.execute_fetchall(sql, tuple(params))
+        return pd.DataFrame(
+            rows,
+            columns=[
+                "symbol", "ts", "funding_rate", "mark_price", "last_price",
+                "next_funding_ts", "funding_interval_hours", "created_at",
+            ],
+        )

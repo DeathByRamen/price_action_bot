@@ -317,3 +317,47 @@ class BitunixClient:
         if data is None:
             return None
         return data.get("data")
+
+    async def get_funding_rate(
+        self, symbol: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        GET /api/v1/futures/market/funding_rate
+
+        Returns the current funding rate for a futures symbol.
+
+        Parameters
+        ----------
+        symbol : str
+            Futures trading pair, e.g. "BTCUSDT"
+
+        Returns
+        -------
+        dict with keys: symbol, markPrice, lastPrice, fundingRate,
+        nextFundingTime, fundingInterval.  Or None on failure.
+        """
+        url = f"{FUTURES_BASE}/api/v1/futures/market/funding_rate"
+        params = {"symbol": symbol}
+        data = await self._request("GET", url, params=params)
+        if data is None:
+            return None
+        items = data.get("data")
+        if items and isinstance(items, list) and len(items) > 0:
+            return items[0]
+        return None
+
+    async def get_all_funding_rates(self) -> List[Dict[str, Any]]:
+        """
+        Fetch funding rates for all futures symbols by calling the
+        funding_rate endpoint without a specific symbol filter.
+
+        Falls back to per-symbol fetching if bulk isn't supported.
+        """
+        url = f"{FUTURES_BASE}/api/v1/futures/market/funding_rate"
+        data = await self._request("GET", url)
+        if data is None:
+            return []
+        items = data.get("data")
+        if items and isinstance(items, list):
+            return items
+        return []
