@@ -27,7 +27,7 @@ class DiscordNotifier(Notifier):
     def name(self) -> str:
         return "Discord"
 
-    async def send(self, message: str) -> bool:
+    async def send(self, message: str, subject: str | None = None) -> bool:
         # Discord has a 2000 char limit; truncate if needed
         if len(message) > MAX_DISCORD_MSG_LEN:
             message = message[: MAX_DISCORD_MSG_LEN - 20] + "\n... (truncated)"

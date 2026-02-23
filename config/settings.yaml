@@ -51,7 +51,7 @@ notifications:
     password: ""
     from_addr: "seanmcgill714@gmail.com"
     to_addrs:
-      - "seanmcgill714@gmail.com"
+      - "mcgillfinance@gmail.com"
 
 # ---------------------------------------------------------------
 # Data storage

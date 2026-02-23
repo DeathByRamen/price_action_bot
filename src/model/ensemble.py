@@ -272,41 +272,53 @@ def format_multi_timeframe_message(
     secondary_label: str = "15m",
 ) -> str:
     """Format multi-timeframe predictions as a notification message."""
+    from datetime import datetime, timezone
+
     preds = predictions[:top_n]
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    # Count totals across ALL predictions (not just top N)
+    total_strong = sum(1 for p in predictions if p.agreement == "STRONG")
+    total_partial = sum(1 for p in predictions if p.agreement == "PARTIAL")
+    total_conflict = sum(1 for p in predictions if p.agreement == "CONFLICT")
+    total_up = sum(1 for p in predictions if p.combined_direction == "UP")
+    total_down = sum(1 for p in predictions if p.combined_direction == "DOWN")
+
+    header = f"PA Bot — Ensemble ({primary_label} + {secondary_label})  |  {now_utc}"
 
     lines = [
-        f"**PA Bot Multi-Timeframe Predictions** ({primary_label} + {secondary_label})",
-        f"Top {len(preds)} signals by conviction:\n",
-        "```",
-        f"{'#':>3} {'Symbol':<12} {primary_label:>4} {secondary_label:>4}  {'Signal':<12} "
-        f"{'Prob':>6} {'Mag%':>7} {'Price':>12} {'Score':>7}",
-        f"{'---':>3} {'------':<12} {'---':>4} {'---':>4}  {'------':<12} "
-        f"{'----':>6} {'----':>7} {'-----':>12} {'-----':>7}",
+        header,
+        "=" * len(header),
+        f"Analyzed {len(predictions)} symbols  |  "
+        f"Market: {total_up} UP / {total_down} DOWN  |  "
+        f"{total_strong} strong / {total_partial} partial / {total_conflict} conflict",
+        "",
+        f"Top {len(preds)} signals by conviction:",
+        "",
+        f"{'#':>3}  {'Symbol':<14} {primary_label:>4} {secondary_label:>4}  {'Signal':<13} "
+        f"{'Prob':>6}  {'Mag%':>7}  {'Price':>12}  {'Score':>7}",
+        f"{'─'*3}  {'─'*14} {'─'*4} {'─'*4}  {'─'*13} "
+        f"{'─'*6}  {'─'*7}  {'─'*12}  {'─'*7}",
     ]
 
     for i, p in enumerate(preds, 1):
+        pri_icon = "▲" if p.primary.direction == "UP" else "▼" if p.primary.direction == "DOWN" else "─"
+        sec_icon = "▲" if p.secondary.direction == "UP" else "▼" if p.secondary.direction == "DOWN" else "─"
         lines.append(
-            f"{i:>3} {p.symbol:<12} "
-            f"{p.primary.direction:>4} {p.secondary.direction:>4}  "
-            f"{p.agreement_label:<12} "
-            f"{max(p.combined_prob_up, p.combined_prob_down):>5.1%} "
-            f"{p.combined_magnitude:>+6.2%} "
-            f"{p.current_price:>12.4f} "
+            f"{i:>3}  {p.symbol:<14} "
+            f" {pri_icon}{p.primary.direction[0]:>1}   {sec_icon}{p.secondary.direction[0]:>1}  "
+            f"{p.agreement_label:<13} "
+            f"{max(p.combined_prob_up, p.combined_prob_down):>5.1%}  "
+            f"{p.combined_magnitude:>+6.2%}  "
+            f"{p.current_price:>12.4f}  "
             f"{p.combined_score:>7.4f}"
         )
 
-    lines.append("```")
-
-    # Summary stats
-    strong = sum(1 for p in preds if p.agreement == "STRONG")
-    conflict = sum(1 for p in preds if p.agreement == "CONFLICT")
-    lines.append(
-        f"\n{primary_label}: directional bias | {secondary_label}: entry timing | "
-        f"Signal: agreement level"
-    )
-    if strong:
-        lines.append(f"STRONG signals (both agree): {strong}")
-    if conflict:
-        lines.append(f"CONFLICT signals (disagree): {conflict} -- approach with caution")
+    lines.append("")
+    lines.append(f"Legend: {primary_label} = directional bias | {secondary_label} = entry timing")
+    lines.append("        Signal = agreement level | Prob = combined confidence")
+    lines.append("        Mag% = predicted move | Score = signal strength")
+    lines.append("")
+    lines.append("STRONG = both agree  |  PARTIAL = one flat/pullback  |  CONFLICT = oppose")
 
     return "\n".join(lines)

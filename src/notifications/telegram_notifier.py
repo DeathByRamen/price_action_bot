@@ -29,7 +29,7 @@ class TelegramNotifier(Notifier):
     def name(self) -> str:
         return "Telegram"
 
-    async def send(self, message: str) -> bool:
+    async def send(self, message: str, subject: str | None = None) -> bool:
         if len(message) > MAX_TELEGRAM_MSG_LEN:
             message = message[: MAX_TELEGRAM_MSG_LEN - 20] + "\n... (truncated)"
 

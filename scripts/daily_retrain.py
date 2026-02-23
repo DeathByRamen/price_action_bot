@@ -135,9 +135,12 @@ async def send_accuracy_digest(
     if importance_report:
         message += "\n\n" + importance_report
 
+    from datetime import datetime, timezone
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    subject = f"[PA Bot] Daily Accuracy Digest — {now_utc}"
     for channel in dispatcher._channels:
         try:
-            await channel.send(message)
+            await channel.send(message, subject=subject)
         except Exception as exc:
             logging.error("Failed to send accuracy digest via %s: %s", channel.name, exc)
 

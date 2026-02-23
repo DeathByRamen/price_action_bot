@@ -173,7 +173,7 @@ async def run_pipeline(
 
         # 6. Dispatch notifications (only in single-timeframe mode)
         if not model_path or "multi" not in str(model_path):
-            await dispatcher.dispatch(ranked, top_n=top_n)
+            await dispatcher.dispatch(ranked, top_n=top_n, interval=interval)
 
         # 7. Log predictions to database
         if ranked:
@@ -273,6 +273,12 @@ async def run_multi_timeframe_pipeline(
     # Dispatch combined notifications
     dispatcher = build_dispatcher(config)
     if combined and dispatcher._channels:
+        from datetime import datetime, timezone as tz
+        now_utc = datetime.now(tz.utc).strftime("%Y-%m-%d %H:%M UTC")
+        subject = (
+            f"[PA Bot] Ensemble ({primary_interval}m + {secondary_interval}m) "
+            f"— {now_utc}"
+        )
         message = format_multi_timeframe_message(
             combined,
             top_n=top_n,
@@ -281,7 +287,7 @@ async def run_multi_timeframe_pipeline(
         )
         for channel in dispatcher._channels:
             try:
-                await channel.send(message)
+                await channel.send(message, subject=subject)
             except Exception as exc:
                 logger.error("Failed to send multi-TF alert via %s: %s", channel.name, exc)
 
