@@ -25,9 +25,9 @@ logger = logging.getLogger(__name__)
 
 COINALYZE_BASE = "https://api.coinalyze.net/v1"
 
-# 40 calls/min = 0.667 calls/sec — use 0.6 for safety margin
-_RATE_LIMIT = 0.6
-_BURST = 5
+# 40 calls/min = 0.667 calls/sec — use 0.55 for safety margin
+_RATE_LIMIT = 0.55
+_BURST = 2
 
 
 @dataclass
@@ -99,9 +99,10 @@ class CoinalyzeClient:
             try:
                 async with self._session.get(url, params=params) as resp:
                     if resp.status == 429:
-                        retry_after = int(resp.headers.get("Retry-After", 10))
+                        retry_after = float(resp.headers.get("Retry-After", 10))
+                        retry_after = max(retry_after, 1.0)
                         logger.warning(
-                            "Coinalyze rate-limited (429). Waiting %ds", retry_after
+                            "Coinalyze rate-limited (429). Waiting %.1fs", retry_after
                         )
                         await asyncio.sleep(retry_after)
                         continue
