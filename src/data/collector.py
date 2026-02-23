@@ -388,6 +388,85 @@ class DataCollector:
         return rows
 
     # ------------------------------------------------------------------
+    # Coinalyze data parsing
+    # ------------------------------------------------------------------
+    @staticmethod
+    def parse_coinalyze_results(
+        raw: dict,
+        reverse_map: dict[str, str],
+    ) -> tuple[list[tuple], list[tuple], list[tuple]]:
+        """
+        Parse raw Coinalyze API results into storage-ready rows.
+
+        Parameters
+        ----------
+        raw : dict with keys "oi", "liquidations", "long_short"
+        reverse_map : mapping from Coinalyze symbol -> our symbol
+                      (e.g. "BTCUSDT_PERP.A" -> "BTCUSDT")
+
+        Returns
+        -------
+        (oi_rows, liq_rows, ls_rows) ready for bulk insert.
+        """
+        from datetime import datetime, timezone
+
+        def _ts_to_iso(unix_sec: int) -> str:
+            return datetime.fromtimestamp(
+                unix_sec, tz=timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%S")
+
+        oi_rows: list[tuple] = []
+        for entry in raw.get("oi", []):
+            ca_sym = entry.get("symbol", "")
+            our_sym = reverse_map.get(ca_sym)
+            if not our_sym:
+                continue
+            for point in entry.get("history", []):
+                oi_rows.append((
+                    our_sym,
+                    _ts_to_iso(point["t"]),
+                    float(point.get("o", 0)),
+                    float(point.get("h", 0)),
+                    float(point.get("l", 0)),
+                    float(point.get("c", 0)),
+                ))
+
+        liq_rows: list[tuple] = []
+        for entry in raw.get("liquidations", []):
+            ca_sym = entry.get("symbol", "")
+            our_sym = reverse_map.get(ca_sym)
+            if not our_sym:
+                continue
+            for point in entry.get("history", []):
+                liq_rows.append((
+                    our_sym,
+                    _ts_to_iso(point["t"]),
+                    float(point.get("l", 0)),
+                    float(point.get("s", 0)),
+                ))
+
+        ls_rows: list[tuple] = []
+        for entry in raw.get("long_short", []):
+            ca_sym = entry.get("symbol", "")
+            our_sym = reverse_map.get(ca_sym)
+            if not our_sym:
+                continue
+            for point in entry.get("history", []):
+                ls_rows.append((
+                    our_sym,
+                    _ts_to_iso(point["t"]),
+                    float(point.get("r", 0)),
+                    float(point.get("l", 0)),
+                    float(point.get("s", 0)),
+                ))
+
+        logger.info(
+            "Coinalyze parsed: %d OI rows, %d liquidation rows, %d L/S rows",
+            len(oi_rows), len(liq_rows), len(ls_rows),
+        )
+        return oi_rows, liq_rows, ls_rows
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
     @staticmethod

@@ -11,6 +11,25 @@ bitunix:
   api_secret: ""
 
 # ---------------------------------------------------------------
+# Coinalyze API (free — OI, liquidations, long/short ratios)
+# API key loaded from .env as COINALYZE_API_KEY
+# ---------------------------------------------------------------
+coinalyze:
+  api_key: ""                  # loaded from .env
+  exchange: "A"                # Binance perpetuals (largest, most liquid)
+  collection_interval: "15min" # data granularity for ongoing collection
+  enabled: true
+
+# ---------------------------------------------------------------
+# Coinalyze API (free — for OI, liquidation, long/short data)
+# Get a key at: https://coinalyze.net/account/api-key/
+# ---------------------------------------------------------------
+coinalyze:
+  api_key: ""                  # or set COINALYZE_API_KEY in .env
+  exchange: "A"                # Binance perpetuals (largest, most liquid)
+  collection_interval: "15min" # data granularity (collected hourly)
+
+# ---------------------------------------------------------------
 # Model parameters
 # ---------------------------------------------------------------
 model:

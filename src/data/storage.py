@@ -130,6 +130,45 @@ CREATE TABLE IF NOT EXISTS funding_rate_snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_fr_sym_ts ON funding_rate_snapshots(symbol, ts);
+
+CREATE TABLE IF NOT EXISTS coinalyze_oi (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol     TEXT    NOT NULL,
+    ts         TEXT    NOT NULL,
+    oi_open    REAL,
+    oi_high    REAL,
+    oi_low     REAL,
+    oi_close   REAL,
+    created_at TEXT    DEFAULT (datetime('now')),
+    UNIQUE(symbol, ts)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ca_oi_sym_ts ON coinalyze_oi(symbol, ts);
+
+CREATE TABLE IF NOT EXISTS coinalyze_liquidations (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol     TEXT    NOT NULL,
+    ts         TEXT    NOT NULL,
+    long_vol   REAL    NOT NULL DEFAULT 0,
+    short_vol  REAL    NOT NULL DEFAULT 0,
+    created_at TEXT    DEFAULT (datetime('now')),
+    UNIQUE(symbol, ts)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ca_liq_sym_ts ON coinalyze_liquidations(symbol, ts);
+
+CREATE TABLE IF NOT EXISTS coinalyze_long_short (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol     TEXT    NOT NULL,
+    ts         TEXT    NOT NULL,
+    ratio      REAL,
+    long_pct   REAL,
+    short_pct  REAL,
+    created_at TEXT    DEFAULT (datetime('now')),
+    UNIQUE(symbol, ts)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ca_ls_sym_ts ON coinalyze_long_short(symbol, ts);
 """
 
 MIGRATION_SQL = """
@@ -832,4 +871,140 @@ class Storage:
                 "symbol", "ts", "funding_rate", "mark_price", "last_price",
                 "next_funding_ts", "funding_interval_hours", "created_at",
             ],
+        )
+
+    # ------------------------------------------------------------------
+    # Coinalyze: open interest
+    # ------------------------------------------------------------------
+    async def insert_coinalyze_oi(self, rows: List[Tuple]) -> int:
+        """
+        Bulk-insert open interest OHLC rows.
+        Each row: (symbol, ts, oi_open, oi_high, oi_low, oi_close)
+        """
+        assert self._db is not None
+        sql = """
+            INSERT OR IGNORE INTO coinalyze_oi
+                (symbol, ts, oi_open, oi_high, oi_low, oi_close)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """
+        cursor = await self._db.executemany(sql, rows)
+        await self._db.commit()
+        return cursor.rowcount
+
+    async def get_coinalyze_oi(
+        self,
+        symbol: str,
+        start_ts: Optional[str] = None,
+        end_ts: Optional[str] = None,
+        limit: int = 5000,
+    ) -> pd.DataFrame:
+        assert self._db is not None
+        conditions = ["symbol = ?"]
+        params: list = [symbol]
+        if start_ts:
+            conditions.append("ts >= ?")
+            params.append(start_ts)
+        if end_ts:
+            conditions.append("ts <= ?")
+            params.append(end_ts)
+        where = " AND ".join(conditions)
+        params.append(limit)
+        sql = f"""
+            SELECT symbol, ts, oi_open, oi_high, oi_low, oi_close
+            FROM coinalyze_oi WHERE {where} ORDER BY ts ASC LIMIT ?
+        """
+        rows = await self._db.execute_fetchall(sql, tuple(params))
+        return pd.DataFrame(
+            rows,
+            columns=["symbol", "ts", "oi_open", "oi_high", "oi_low", "oi_close"],
+        )
+
+    # ------------------------------------------------------------------
+    # Coinalyze: liquidations
+    # ------------------------------------------------------------------
+    async def insert_coinalyze_liquidations(self, rows: List[Tuple]) -> int:
+        """
+        Bulk-insert liquidation rows.
+        Each row: (symbol, ts, long_vol, short_vol)
+        """
+        assert self._db is not None
+        sql = """
+            INSERT OR IGNORE INTO coinalyze_liquidations
+                (symbol, ts, long_vol, short_vol)
+            VALUES (?, ?, ?, ?)
+        """
+        cursor = await self._db.executemany(sql, rows)
+        await self._db.commit()
+        return cursor.rowcount
+
+    async def get_coinalyze_liquidations(
+        self,
+        symbol: str,
+        start_ts: Optional[str] = None,
+        end_ts: Optional[str] = None,
+        limit: int = 5000,
+    ) -> pd.DataFrame:
+        assert self._db is not None
+        conditions = ["symbol = ?"]
+        params: list = [symbol]
+        if start_ts:
+            conditions.append("ts >= ?")
+            params.append(start_ts)
+        if end_ts:
+            conditions.append("ts <= ?")
+            params.append(end_ts)
+        where = " AND ".join(conditions)
+        params.append(limit)
+        sql = f"""
+            SELECT symbol, ts, long_vol, short_vol
+            FROM coinalyze_liquidations WHERE {where} ORDER BY ts ASC LIMIT ?
+        """
+        rows = await self._db.execute_fetchall(sql, tuple(params))
+        return pd.DataFrame(
+            rows, columns=["symbol", "ts", "long_vol", "short_vol"],
+        )
+
+    # ------------------------------------------------------------------
+    # Coinalyze: long/short ratio
+    # ------------------------------------------------------------------
+    async def insert_coinalyze_long_short(self, rows: List[Tuple]) -> int:
+        """
+        Bulk-insert long/short ratio rows.
+        Each row: (symbol, ts, ratio, long_pct, short_pct)
+        """
+        assert self._db is not None
+        sql = """
+            INSERT OR IGNORE INTO coinalyze_long_short
+                (symbol, ts, ratio, long_pct, short_pct)
+            VALUES (?, ?, ?, ?, ?)
+        """
+        cursor = await self._db.executemany(sql, rows)
+        await self._db.commit()
+        return cursor.rowcount
+
+    async def get_coinalyze_long_short(
+        self,
+        symbol: str,
+        start_ts: Optional[str] = None,
+        end_ts: Optional[str] = None,
+        limit: int = 5000,
+    ) -> pd.DataFrame:
+        assert self._db is not None
+        conditions = ["symbol = ?"]
+        params: list = [symbol]
+        if start_ts:
+            conditions.append("ts >= ?")
+            params.append(start_ts)
+        if end_ts:
+            conditions.append("ts <= ?")
+            params.append(end_ts)
+        where = " AND ".join(conditions)
+        params.append(limit)
+        sql = f"""
+            SELECT symbol, ts, ratio, long_pct, short_pct
+            FROM coinalyze_long_short WHERE {where} ORDER BY ts ASC LIMIT ?
+        """
+        rows = await self._db.execute_fetchall(sql, tuple(params))
+        return pd.DataFrame(
+            rows, columns=["symbol", "ts", "ratio", "long_pct", "short_pct"],
         )

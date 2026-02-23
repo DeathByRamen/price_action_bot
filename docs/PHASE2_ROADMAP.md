@@ -49,6 +49,20 @@ The infrastructure to collect order book snapshots is built and deployed:
 - Hourly predictions + daily retrain on cron
 - Email notifications
 
+### Coinalyze Derivatives Data Collection (Phase 2G — COMPLETE)
+
+Open interest, liquidation, and long/short ratio data from Coinalyze (free API, aggregated across Binance/Bybit/OKX):
+
+- **API client:** `src/api/coinalyze_client.py` — async client with rate limiting (40 calls/min), retry, symbol mapping (our BTCUSDT -> Coinalyze BTCUSDT_PERP.A), batch requests (20 symbols/request)
+- **Collector method:** `DataCollector.parse_coinalyze_results()` in `src/data/collector.py` — parses raw API responses into storage-ready rows
+- **Storage tables:**
+  - `coinalyze_oi` — open interest OHLC: `(symbol, ts, oi_open, oi_high, oi_low, oi_close)`
+  - `coinalyze_liquidations` — liquidation volume by direction: `(symbol, ts, long_vol, short_vol)`
+  - `coinalyze_long_short` — long/short ratio: `(symbol, ts, ratio, long_pct, short_pct)`
+- **Collection script:** `scripts/collect_coinalyze.py` — runs hourly, fetches last 1 hour at 15-min granularity
+- **Backfill script:** `scripts/backfill_coinalyze.py` — one-time backfill of daily data (up to 1 year) and 15-min data (~14 days)
+- **Rate limit strategy:** hourly collection (not 15-min) because 250 symbols × 3 data types = 750 API calls at 40/min = ~19 min
+
 ### What We're Waiting For
 
 Order book snapshots need to accumulate for **2-4 weeks** before Phase 2A can begin. This gives:
@@ -463,7 +477,10 @@ These could be sourced from third-party providers (CoinGlass API, Coinalyze) in 
 | `src/pipeline.py` | Main prediction pipeline orchestrator |
 | `src/scoring/accuracy.py` | Prediction scoring against actual outcomes |
 | `src/scoring/adaptive.py` | FLAT threshold auto-tuning + sample weighting |
-| `scripts/collect_orderbook.py` | Cron script for OB + funding rate snapshot collection |
+| `scripts/collect_orderbook.py` | Cron script for OB + funding rate snapshot collection (every 15 min) |
+| `scripts/collect_coinalyze.py` | Cron script for Coinalyze OI + liquidation + L/S collection (hourly) |
+| `scripts/backfill_coinalyze.py` | One-time historical Coinalyze data backfill |
+| `src/api/coinalyze_client.py` | Async Coinalyze API client with rate limiting and symbol mapping |
 | `scripts/run_prediction.py` | Cron script for hourly predictions |
 | `scripts/daily_retrain.py` | Cron script for daily retrain + feedback loop |
 | `scripts/train_model.py` | Manual training script |
