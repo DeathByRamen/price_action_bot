@@ -96,7 +96,7 @@ timeframes:
     weight: 0.6                                 # ensemble weight
   secondary:
     interval: "15"                              # 15m candles — entry timing
-    window_size: 672                            # 7 days of 15m candles (168 * 4)
+    window_size: 168                            # ~42h of 15m candles (increase to 672 when more data available)
     checkpoint: "data/models/model_final_15.pt"
     weight: 0.4                                 # ensemble weight
 
