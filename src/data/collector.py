@@ -11,6 +11,7 @@ import logging
 from typing import List, Optional
 
 from src.api.bitunix_client import BitunixClient, Candle, Ticker
+from src.data.quality import validate_candles
 from src.data.storage import Storage
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,8 @@ class DataCollector:
                         symbol=symbol, interval=interval, limit=lookback
                     )
                     if candles:
+                        candles = validate_candles(candles)
+                    if candles:
                         rows = self._candles_to_rows(candles)
                         inserted = await self.storage.insert_candles(rows, interval=interval)
                         if inserted:
@@ -130,8 +133,19 @@ class DataCollector:
         inserted_total = 0
         end_time: Optional[int] = None
         remaining = total_candles
+        max_iterations = (total_candles // max(batch_size, 1)) + 10
+        iteration = 0
+        prev_end_time: Optional[int] = None
 
         while remaining > 0:
+            iteration += 1
+            if iteration > max_iterations:
+                logger.warning(
+                    "%s: backfill exceeded %d iterations — stopping to prevent infinite loop",
+                    symbol, max_iterations,
+                )
+                break
+
             fetch_count = min(remaining, batch_size)
             try:
                 candles = await self.client.get_kline_history(
@@ -146,6 +160,11 @@ class DataCollector:
 
             if not candles:
                 logger.debug("%s: no more candles returned", symbol)
+                break
+
+            candles = validate_candles(candles)
+            if not candles:
+                logger.debug("%s: all candles rejected by validation", symbol)
                 break
 
             rows = self._candles_to_rows(candles)
@@ -165,6 +184,13 @@ class DataCollector:
                     earliest_ts,
                 )
                 break
+
+            if end_time == prev_end_time:
+                logger.warning(
+                    "%s: backfill stuck at same timestamp — breaking", symbol
+                )
+                break
+            prev_end_time = end_time
 
             remaining -= len(candles)
             if len(candles) < fetch_count:

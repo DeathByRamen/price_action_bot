@@ -144,6 +144,13 @@ class Predictor:
         window = (window - means) / stds
         window = np.nan_to_num(window, nan=0.0, posinf=0.0, neginf=0.0)
 
+        if np.all(window == 0) or np.std(window) < 1e-8:
+            logger.warning(
+                "%s: degenerate feature window (all zeros or no variance) — skipping",
+                symbol,
+            )
+            return None
+
         x = torch.from_numpy(window).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
@@ -235,6 +242,12 @@ class Predictor:
             stds[stds == 0] = 1.0
             window = (window - means) / stds
             window = np.nan_to_num(window, nan=0.0, posinf=0.0, neginf=0.0)
+
+            if np.all(window == 0) or np.std(window) < 1e-8:
+                logger.warning(
+                    "%s: degenerate feature window (batch) — skipping", symbol
+                )
+                continue
 
             valid_symbols.append(symbol)
             windows.append(window)

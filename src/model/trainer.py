@@ -108,6 +108,13 @@ class Trainer:
 
         Returns a dict of training history: {train_loss, val_loss, val_acc, ...}
         """
+        if len(train_ds) == 0:
+            logger.error("[%s] Training dataset is empty — cannot train", tag)
+            return {"train_loss": [], "val_loss": [], "val_cls_acc": [], "val_reg_mae": []}
+        if len(val_ds) == 0:
+            logger.error("[%s] Validation dataset is empty — cannot train", tag)
+            return {"train_loss": [], "val_loss": [], "val_cls_acc": [], "val_reg_mae": []}
+
         if use_sample_weights:
             sampler = train_ds.get_sampler()
             train_loader = DataLoader(
@@ -221,6 +228,10 @@ class Trainer:
             [self.model.temperature], lr=0.01, max_iter=50
         )
 
+        # Compute baseline NLL at temperature = 1.0
+        with torch.no_grad():
+            baseline_nll = nll(all_logits, all_labels).item()
+
         def _closure():
             optimizer.zero_grad()
             scaled = all_logits / self.model.temperature.clamp(min=0.01)
@@ -230,12 +241,32 @@ class Trainer:
 
         optimizer.step(_closure)
 
+        # Compute NLL with optimized temperature
+        with torch.no_grad():
+            calibrated_nll = nll(
+                all_logits / self.model.temperature.clamp(min=0.01), all_labels
+            ).item()
+
+        temp = self.model.temperature.item()
+
+        if calibrated_nll >= baseline_nll:
+            logger.warning(
+                "Calibrated temperature (%.4f, NLL=%.4f) did not improve over "
+                "default (1.0, NLL=%.4f) — reverting to 1.0",
+                temp, calibrated_nll, baseline_nll,
+            )
+            self.model.temperature.data.fill_(1.0)
+            temp = 1.0
+        else:
+            logger.info(
+                "Temperature calibrated to %.4f (NLL %.4f -> %.4f, improved by %.4f)",
+                temp, baseline_nll, calibrated_nll, baseline_nll - calibrated_nll,
+            )
+
         # Restore requires_grad
         for param in self.model.parameters():
             param.requires_grad = True
 
-        temp = self.model.temperature.item()
-        logger.info("Temperature calibrated to %.4f", temp)
         return temp
 
     # ------------------------------------------------------------------
