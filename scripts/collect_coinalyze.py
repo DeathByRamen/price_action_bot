@@ -25,6 +25,9 @@ import time
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from src.api.bitunix_client import BitunixClient
 from src.api.coinalyze_client import CoinalyzeClient
 from src.data.collector import DataCollector
