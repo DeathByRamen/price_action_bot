@@ -42,6 +42,8 @@ class Prediction:
     signal_score: float       # entropy-weighted conviction * directional prob * magnitude
     conviction: float         # 1 - normalized_entropy (0 = random, 1 = certain)
     current_price: float
+    uncertainty: float = 0.0  # MC Dropout uncertainty (0 = certain, higher = less certain)
+    regime: str = ""          # market regime label (set by pipeline)
     feature_attention: Optional[Dict[str, float]] = field(default=None, repr=False)
     temporal_attention: Optional[np.ndarray] = field(default=None, repr=False)
 
@@ -166,21 +168,21 @@ class Predictor:
                 cls_logits, mag_pred = self.model(x)
                 feat_w = temp_w = None
 
-            # Apply calibrated temperature for well-calibrated probabilities
             temperature = self.model.temperature.clamp(min=0.01)
             scaled_logits = cls_logits / temperature
             probs = torch.softmax(scaled_logits, dim=1).squeeze(0).cpu().numpy()
             magnitude = mag_pred.squeeze().cpu().item()
 
+        uncertainty = self._estimate_uncertainty(x)
+
         direction_idx = int(np.argmax(probs))
         direction = DIRECTION_LABELS[direction_idx]
 
-        # Entropy-based conviction scoring
         conviction, signal_score = _compute_signal_score(probs, magnitude)
+        signal_score *= max(0.1, 1.0 - uncertainty)
 
         current_price = float(df["close"].iloc[-1])
 
-        # Attention weights (optional, for interpretability)
         feat_attention = None
         temp_attention = None
         if feat_w is not None:
@@ -199,6 +201,7 @@ class Predictor:
             signal_score=signal_score,
             conviction=conviction,
             current_price=current_price,
+            uncertainty=uncertainty,
             feature_attention=feat_attention,
             temporal_attention=temp_attention,
         )
@@ -282,7 +285,10 @@ class Predictor:
             all_probs = torch.softmax(scaled_logits, dim=1).cpu().numpy()
             all_mags = mag_pred.squeeze(-1).cpu().numpy()
 
-        # Step 3: Build Prediction objects
+        # Step 3: MC Dropout uncertainty for the batch
+        uncertainties = self._estimate_uncertainty_batch(batch, len(valid_symbols))
+
+        # Step 4: Build Prediction objects
         predictions: List[Prediction] = []
         for i, symbol in enumerate(valid_symbols):
             probs = all_probs[i]
@@ -290,6 +296,8 @@ class Predictor:
             direction_idx = int(np.argmax(probs))
             direction = DIRECTION_LABELS[direction_idx]
             conviction, signal_score = _compute_signal_score(probs, magnitude)
+            unc = uncertainties[i]
+            signal_score *= max(0.1, 1.0 - unc)
 
             feat_attention = None
             temp_attention = None
@@ -309,11 +317,51 @@ class Predictor:
                 signal_score=signal_score,
                 conviction=conviction,
                 current_price=prices[i],
+                uncertainty=unc,
                 feature_attention=feat_attention,
                 temporal_attention=temp_attention,
             ))
 
         return predictions
+
+    def _estimate_uncertainty(self, x: torch.Tensor, n_samples: int = 10) -> float:
+        """Run MC Dropout and return mean probability std as uncertainty."""
+        try:
+            self.model.train()
+            all_probs = []
+            with torch.no_grad():
+                for _ in range(n_samples):
+                    cls_logits, _ = self.model(x)[:2]
+                    temp = self.model.temperature.clamp(min=0.01)
+                    probs = torch.softmax(cls_logits / temp, dim=-1)
+                    all_probs.append(probs.cpu().numpy())
+            self.model.eval()
+            stacked = np.array(all_probs).squeeze()
+            return float(stacked.std(axis=0).mean())
+        except Exception:
+            self.model.eval()
+            return 0.0
+
+    def _estimate_uncertainty_batch(
+        self, batch: torch.Tensor, n_items: int, n_samples: int = 10
+    ) -> List[float]:
+        """Run MC Dropout for a batch and return per-item uncertainty."""
+        try:
+            self.model.train()
+            all_probs = []
+            with torch.no_grad():
+                for _ in range(n_samples):
+                    cls_logits, _ = self.model(batch)[:2]
+                    temp = self.model.temperature.clamp(min=0.01)
+                    probs = torch.softmax(cls_logits / temp, dim=-1)
+                    all_probs.append(probs.cpu().numpy())
+            self.model.eval()
+            stacked = np.array(all_probs)  # (n_samples, n_items, 3)
+            per_item_std = stacked.std(axis=0).mean(axis=1)  # (n_items,)
+            return [float(v) for v in per_item_std]
+        except Exception:
+            self.model.eval()
+            return [0.0] * n_items
 
     def rank_predictions(self, predictions: List[Prediction]) -> List[Prediction]:
         """Sort predictions by signal_score descending (strongest conviction first)."""

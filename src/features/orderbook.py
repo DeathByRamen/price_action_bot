@@ -95,7 +95,7 @@ def compute_orderbook_features(
 
     for col in get_orderbook_feature_columns():
         if col in merged.columns:
-            merged[col] = merged[col].ffill()
+            merged[col] = merged[col].fillna(0.0)
 
     return merged
 

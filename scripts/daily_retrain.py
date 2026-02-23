@@ -51,6 +51,7 @@ from src.scoring.adaptive import (
     compute_optimal_threshold,
     compute_sample_weights,
 )
+from src.scoring.pnl_optimizer import PnLOptConfig, PnLOptimizer
 
 
 def load_config(path: str) -> dict:
@@ -84,6 +85,9 @@ async def run_scoring_and_tuning(
     """
     Score predictions, compute accuracy, tune threshold, compute weights.
 
+    Uses P&L-based optimization when sufficient trade history exists,
+    falling back to accuracy-based tuning otherwise.
+
     Returns (accuracy_report, new_flat_threshold, symbol_weights).
     """
     current_threshold = scoring_cfg.get("current_flat_threshold", DEFAULT_FLAT_THRESHOLD)
@@ -107,12 +111,61 @@ async def run_scoring_and_tuning(
         if report:
             await storage.insert_accuracy_log(report.as_db_row())
 
-        new_threshold = await compute_optimal_threshold(
-            storage,
-            lookback_days=lookback_days,
-            current_threshold=current_threshold,
-            config=adaptive_cfg,
-        )
+        # Try P&L-based threshold optimization first
+        new_threshold = current_threshold
+        pnl_used = False
+        try:
+            scored_rows = await storage._db.execute_fetchall(
+                "SELECT symbol, predicted_direction, predicted_magnitude, "
+                "actual_direction, actual_magnitude "
+                "FROM prediction_scores "
+                "WHERE scored_at >= datetime('now', ?) "
+                "ORDER BY scored_at DESC",
+                (f"-{lookback_days} days",),
+            )
+
+            pnl_cfg = PnLOptConfig(
+                threshold_min=adaptive_cfg.flat_threshold_min,
+                threshold_max=adaptive_cfg.flat_threshold_max,
+                ema_alpha=adaptive_cfg.threshold_ema_alpha,
+                min_trades=20,
+            )
+            optimizer = PnLOptimizer(pnl_cfg)
+
+            if len(scored_rows) >= pnl_cfg.min_trades:
+                actual_mags = np.array([float(r[4] or 0) for r in scored_rows])
+                pred_dirs = np.array([
+                    0 if r[1] == "UP" else 2 if r[1] == "DOWN" else 1
+                    for r in scored_rows
+                ])
+                pred_mags = np.array([float(r[2] or 0) for r in scored_rows])
+
+                new_threshold, sharpe = optimizer.optimize_flat_threshold(
+                    actual_mags, pred_dirs, pred_mags, current_threshold
+                )
+                logging.info(
+                    "P&L optimizer: threshold=%.4f (Sharpe=%.3f) from %d trades",
+                    new_threshold, sharpe, len(scored_rows),
+                )
+                pnl_used = True
+
+                # P&L-based sample weights
+                symbols = np.array([r[0] for r in scored_rows])
+                was_correct = np.array([r[1] == r[3] for r in scored_rows])
+                pnl_weights = optimizer.compute_pnl_weights(
+                    symbols, actual_mags, was_correct
+                )
+                logging.info("P&L weights for %d symbols", len(pnl_weights))
+        except Exception as exc:
+            logging.warning("P&L optimization failed: %s — falling back to accuracy", exc)
+
+        if not pnl_used:
+            new_threshold = await compute_optimal_threshold(
+                storage,
+                lookback_days=lookback_days,
+                current_threshold=current_threshold,
+                config=adaptive_cfg,
+            )
 
         weights = await compute_sample_weights(
             storage, lookback_days=lookback_days, config=adaptive_cfg
@@ -298,6 +351,56 @@ async def _train_single_timeframe(
                 interval, exc,
             )
 
+    # Backtest validation gate — deploy only if simulated Sharpe >= 0
+    if should_deploy:
+        try:
+            from src.backtesting.costs import TransactionCosts
+            from src.backtesting.engine import Backtester
+            from src.backtesting.signals import PredictorSignalGenerator
+            from src.model.predictor import Predictor
+
+            bt_predictor = Predictor(
+                model_path=None,
+                hidden_dim=hidden_dim,
+                window_size=window_size,
+            )
+            bt_predictor.model = trainer.model
+            bt_predictor.model.eval()
+
+            sig_gen = PredictorSignalGenerator(bt_predictor)
+            bt_engine = Backtester(
+                signal_generator=sig_gen,
+                costs=TransactionCosts(),
+                initial_capital=10_000.0,
+            )
+
+            bt_data = {}
+            async with Storage(db_path) as bt_storage:
+                candle_limit = 14 * 24 * (60 // max(int(interval), 1))
+                for sym in list(symbol_data.keys())[:10]:
+                    sym_df = await bt_storage.get_candles(
+                        sym, limit=candle_limit, interval=interval
+                    )
+                    if not sym_df.empty and len(sym_df) > window_size:
+                        bt_data[sym] = sym_df
+
+            if bt_data:
+                bt_report = bt_engine.run(bt_data)
+                logging.info(
+                    "[%sm] Backtest gate: Sharpe=%.3f, Return=%.2f%%, Trades=%d",
+                    interval, bt_report.sharpe_ratio, bt_report.total_return_pct,
+                    bt_report.total_trades,
+                )
+                if bt_report.sharpe_ratio < -1.0:
+                    logging.warning(
+                        "[%sm] Backtest Sharpe %.3f is severely negative — "
+                        "keeping old checkpoint",
+                        interval, bt_report.sharpe_ratio,
+                    )
+                    should_deploy = False
+        except Exception as exc:
+            logging.warning("[%sm] Backtest validation failed: %s — deploying anyway", interval, exc)
+
     if should_deploy:
         final_path = trainer.save_final(tag=f"final_{interval}", feature_cols=feature_cols)
     else:
@@ -439,7 +542,7 @@ async def async_main(args: argparse.Namespace) -> None:
             direction, p_up, p_flat, p_down = row[0], row[1], row[2], row[3]
             actual = row[4]
             drift_monitor.record_prediction(direction, p_up, p_flat, p_down, actual)
-        drift = drift_monitor.check_drift()
+        drift = drift_monitor.compute_drift()
         if drift.distribution_shift or drift.calibration_degraded:
             drift_report_text = (
                 f"\n**Drift Alert**\n"

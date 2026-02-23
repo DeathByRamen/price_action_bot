@@ -45,15 +45,36 @@ class Dispatcher:
         predictions: List[Prediction],
         top_n: int = 10,
         interval: str = "60",
+        regime: str = "",
+        drift_warning: str = "",
+        drawdown_state: str = "",
     ) -> None:
         """Format predictions into an alert message and send to all channels."""
+        if not predictions and drawdown_state == "halted":
+            now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            msg = f"[PA Bot] Signals PAUSED — drawdown circuit breaker active ({now_utc})"
+            for channel in self._channels:
+                try:
+                    await channel.send(msg, subject=f"[PA Bot] HALTED — {now_utc}")
+                except Exception as exc:
+                    logger.error("Error sending halt via %s: %s", channel.name, exc)
+            return
+
         if not predictions:
             logger.info("No predictions to dispatch")
             return
 
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        message = self._format_message(predictions[:top_n], interval=interval, timestamp=now_utc)
-        subject = f"[PA Bot] {interval}m Predictions — {now_utc}"
+        message = self._format_message(
+            predictions[:top_n],
+            interval=interval,
+            timestamp=now_utc,
+            regime=regime,
+            drift_warning=drift_warning,
+            drawdown_state=drawdown_state,
+        )
+        regime_tag = f" | {regime}" if regime and regime != "Unknown" else ""
+        subject = f"[PA Bot] {interval}m Predictions{regime_tag} — {now_utc}"
 
         for channel in self._channels:
             try:
@@ -82,6 +103,9 @@ class Dispatcher:
         predictions: List[Prediction],
         interval: str = "60",
         timestamp: str = "",
+        regime: str = "",
+        drift_warning: str = "",
+        drawdown_state: str = "",
     ) -> str:
         """Build a plain-text alert from ranked predictions."""
         header = f"PA Bot — {interval}m Predictions"
@@ -95,24 +119,40 @@ class Dispatcher:
         lines = [
             header,
             "=" * len(header),
+        ]
+
+        if regime and regime != "Unknown":
+            lines.append(f"Market Regime: {regime}")
+        if drawdown_state and drawdown_state != "normal":
+            lines.append(f"Drawdown State: {drawdown_state.upper()}")
+
+        lines += [
             f"Top {len(predictions)} signals by conviction",
             f"Market bias: {up_count} UP / {down_count} DOWN / {flat_count} FLAT",
             "",
-            f"{'#':>3}  {'Symbol':<14} {'Dir':>5}  {'Prob':>6}  {'Mag%':>7}  {'Price':>12}  {'Score':>7}",
-            f"{'─'*3}  {'─'*14} {'─'*5}  {'─'*6}  {'─'*7}  {'─'*12}  {'─'*7}",
+            f"{'#':>3}  {'Symbol':<14} {'Dir':>5}  {'Prob':>6}  {'Mag%':>7}  "
+            f"{'Price':>12}  {'Score':>7}  {'Unc':>5}",
+            f"{'─'*3}  {'─'*14} {'─'*5}  {'─'*6}  {'─'*7}  "
+            f"{'─'*12}  {'─'*7}  {'─'*5}",
         ]
 
         for i, p in enumerate(predictions, 1):
             max_prob = max(p.prob_up, p.prob_flat, p.prob_down)
             dir_icon = "▲" if p.direction == "UP" else "▼" if p.direction == "DOWN" else "─"
+            unc_str = f"{p.uncertainty:.2f}" if hasattr(p, "uncertainty") else "—"
             lines.append(
                 f"{i:>3}  {p.symbol:<14} {dir_icon} {p.direction:>3}  "
                 f"{max_prob:>5.1%}  {p.magnitude:>+6.2%}  "
-                f"{p.current_price:>12.4f}  {p.signal_score:>7.4f}"
+                f"{p.current_price:>12.4f}  {p.signal_score:>7.4f}  {unc_str:>5}"
             )
 
         lines.append("")
+        if drift_warning:
+            lines.append(f"⚠ DRIFT: {drift_warning}")
+            lines.append("")
+
         lines.append("Legend: Dir = predicted direction | Prob = confidence")
         lines.append("        Mag% = predicted move size | Score = signal strength")
+        lines.append("        Unc = model uncertainty (lower = more confident)")
 
         return "\n".join(lines)

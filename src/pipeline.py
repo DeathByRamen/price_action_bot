@@ -11,6 +11,7 @@ Multi-timeframe:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Dict, List, Optional
@@ -29,6 +30,7 @@ from src.features.derivatives import (
 )
 from src.features.indicators import MAX_WARMUP_PERIODS
 from src.features.orderbook import compute_orderbook_features
+from src.model.drift import DriftMonitor
 from src.model.ensemble import (
     MultiTimeframePrediction,
     combine_timeframes,
@@ -36,12 +38,19 @@ from src.model.ensemble import (
     format_multi_timeframe_message,
 )
 from src.model.predictor import Prediction, Predictor
+from src.model.regime import REGIME_NAMES, RegimeDetector
 from src.notifications.discord_notifier import DiscordNotifier
 from src.notifications.dispatcher import Dispatcher
 from src.notifications.email_notifier import EmailNotifier
 from src.notifications.telegram_notifier import TelegramNotifier
+from src.risk.drawdown import DrawdownConfig, DrawdownManager, DrawdownState
+from src.risk.rules import EntryExitConfig, EntryExitRules
 
 logger = logging.getLogger(__name__)
+
+DRIFT_STATE_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "data", "drift_state.json"
+)
 
 
 def build_dispatcher(config: Dict) -> Dispatcher:
@@ -212,14 +221,102 @@ async def run_pipeline(
 
         logger.info("Generated %d predictions [%sm]", len(all_predictions), interval)
 
-        # 5. Rank by signal strength
+        # 5. Regime detection — adjust signals per market state
+        regime_label = "Unknown"
+        regime_adjustments: Dict[str, float] = {}
+        try:
+            detector = RegimeDetector()
+            detector.fit(btc_df)
+            regime = detector.predict(btc_df)
+            regime_label = REGIME_NAMES.get(regime, "Unknown")
+            regime_adjustments = detector.get_regime_adjustments(regime)
+            logger.info("Detected market regime: %s", regime_label)
+
+            size_mult = regime_adjustments.get("size_multiplier", 1.0)
+            conf_boost = regime_adjustments.get("confidence_boost", 0.0)
+            for p in all_predictions:
+                p.signal_score *= size_mult
+                p.conviction = min(1.0, max(0.0, p.conviction + conf_boost))
+                p.regime = regime_label
+        except Exception as exc:
+            logger.warning("Regime detection failed: %s", exc)
+
+        # 6. Entry rules — filter by volume/spread
+        risk_cfg = config.get("risk", {})
+        entry_cfg = EntryExitConfig(
+            min_volume_24h=risk_cfg.get("min_volume_24h", 100_000.0),
+            max_spread_bps=risk_cfg.get("max_spread_bps", 50.0),
+        )
+        entry_rules = EntryExitRules(entry_cfg)
+        filtered: List[Prediction] = []
+        for p in all_predictions:
+            sym_df = symbol_dfs.get(p.symbol)
+            if sym_df is None:
+                filtered.append(p)
+                continue
+            vol_24h = float(sym_df["volume"].tail(24).sum()) if "volume" in sym_df.columns else 0.0
+            spread = getattr(p, "ob_spread_bps", 0.0)
+            allowed, reason = entry_rules.should_enter(vol_24h, spread)
+            if allowed:
+                filtered.append(p)
+            else:
+                logger.debug("Entry filter rejected %s: %s", p.symbol, reason)
+        all_predictions = filtered
+
+        # 7. Drawdown management — suppress/reduce signals on drawdown
+        drawdown_label = ""
+        try:
+            dd_cfg = DrawdownConfig(
+                reduce_threshold_pct=risk_cfg.get("drawdown_reduce_pct", 5.0),
+                halt_threshold_pct=risk_cfg.get("drawdown_halt_pct", 10.0),
+            )
+            dd_manager = DrawdownManager(dd_cfg)
+            simulated_equity = await _load_simulated_equity(storage)
+            dd_state = dd_manager.update(simulated_equity)
+            drawdown_label = dd_state.value
+
+            if dd_state == DrawdownState.HALTED:
+                logger.warning("Drawdown HALT — suppressing all signals")
+                all_predictions = []
+            elif dd_state == DrawdownState.REDUCED:
+                top_n = max(1, top_n // 2)
+                logger.warning("Drawdown REDUCED — cutting top_n to %d", top_n)
+        except Exception as exc:
+            logger.warning("Drawdown manager failed: %s", exc)
+
+        # 8. Rank by signal strength
         ranked = predictor.rank_predictions(all_predictions)
 
-        # 6. Dispatch notifications (only in single-timeframe mode)
-        if not model_path or "multi" not in str(model_path):
-            await dispatcher.dispatch(ranked, top_n=top_n, interval=interval)
+        # 9. Drift monitoring — continuous alerting
+        drift_warning = ""
+        try:
+            drift_mon = _load_drift_monitor()
+            for p in ranked:
+                drift_mon.record_prediction(p.direction, p.prob_up, p.prob_flat, p.prob_down)
+            if len(drift_mon._prediction_history) >= drift_mon.config.min_samples:
+                if drift_mon._baseline_distribution is None:
+                    drift_mon.set_baseline()
+                drift_report = drift_mon.compute_drift()
+                if drift_report.distribution_shift:
+                    drift_warning = f"Distribution shift detected (KL={drift_report.kl_divergence:.4f})"
+                if drift_report.calibration_degraded:
+                    drift_warning += f" | Calibration degraded (ECE={drift_report.calibration_error:.4f})"
+            _save_drift_monitor(drift_mon)
+        except Exception as exc:
+            logger.warning("Drift monitoring failed: %s", exc)
 
-        # 7. Log predictions to database
+        # 10. Dispatch notifications with enriched context
+        if not model_path or "multi" not in str(model_path):
+            await dispatcher.dispatch(
+                ranked,
+                top_n=top_n,
+                interval=interval,
+                regime=regime_label,
+                drift_warning=drift_warning,
+                drawdown_state=drawdown_label,
+            )
+
+        # 11. Log predictions to database
         if ranked:
             pred_rows = [
                 (
@@ -238,6 +335,63 @@ async def run_pipeline(
             logger.info("Logged %d predictions to database [%sm]", len(pred_rows), interval)
 
     return ranked
+
+
+async def _load_simulated_equity(storage: "Storage") -> float:
+    """Load simulated equity from recent prediction accuracy in the DB."""
+    try:
+        rows = await storage.db.execute_fetchall(
+            "SELECT actual_direction, predicted_direction, predicted_magnitude "
+            "FROM prediction_scores ORDER BY scored_at DESC LIMIT 200"
+        )
+        if not rows:
+            return 10000.0
+        equity = 10000.0
+        for row in reversed(rows):
+            actual, predicted, mag = row
+            mag = float(mag) if mag else 0.0
+            if actual == predicted and predicted != "FLAT":
+                equity += equity * abs(mag)
+            elif actual != predicted and predicted != "FLAT":
+                equity -= equity * abs(mag) * 0.5
+        return equity
+    except Exception:
+        return 10000.0
+
+
+def _load_drift_monitor() -> DriftMonitor:
+    """Load drift monitor state from disk."""
+    monitor = DriftMonitor()
+    try:
+        if os.path.exists(DRIFT_STATE_PATH):
+            with open(DRIFT_STATE_PATH) as f:
+                state = json.load(f)
+            monitor._prediction_history = state.get("history", [])
+            baseline = state.get("baseline")
+            if baseline is not None:
+                import numpy as np
+                monitor._baseline_distribution = np.array(baseline)
+    except Exception:
+        pass
+    return monitor
+
+
+def _save_drift_monitor(monitor: DriftMonitor) -> None:
+    """Persist drift monitor state to disk."""
+    try:
+        state = {
+            "history": monitor._prediction_history[-500:],
+            "baseline": (
+                monitor._baseline_distribution.tolist()
+                if monitor._baseline_distribution is not None
+                else None
+            ),
+        }
+        os.makedirs(os.path.dirname(DRIFT_STATE_PATH), exist_ok=True)
+        with open(DRIFT_STATE_PATH, "w") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
 
 
 async def run_multi_timeframe_pipeline(

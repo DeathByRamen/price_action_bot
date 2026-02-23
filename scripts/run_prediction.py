@@ -23,6 +23,7 @@ import yaml
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from src.monitoring.metrics import MetricsServer, record_prediction, record_prediction_latency
 from src.pipeline import run_multi_timeframe_pipeline, run_pipeline
 
 
@@ -52,12 +53,22 @@ def main() -> None:
         action="store_true",
         help="Run multi-timeframe ensemble (primary + secondary from config)",
     )
+    parser.add_argument(
+        "--metrics-port",
+        type=int,
+        default=8000,
+        help="Prometheus metrics server port (0 to disable)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+    if args.metrics_port > 0:
+        metrics_server = MetricsServer(port=args.metrics_port)
+        metrics_server.start()
 
     start = datetime.now(timezone.utc)
     logging.info("=" * 60)
@@ -66,15 +77,18 @@ def main() -> None:
     logging.info("=" * 60)
 
     config = load_config(args.config)
+    interval = args.interval or config.get("pipeline", {}).get("interval", "60")
 
     if args.multi_timeframe:
         combined = asyncio.run(
             run_multi_timeframe_pipeline(config, db_path=args.db)
         )
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+        record_prediction_latency(elapsed)
         logging.info("Run complete: %d combined predictions in %.1f seconds", len(combined), elapsed)
 
         for i, p in enumerate(combined[:5], 1):
+            record_prediction(p.primary.direction, interval=interval)
             logging.info(
                 "  #%d %s %s (1h=%s, 15m=%s, score=%.4f)",
                 i,
@@ -94,17 +108,20 @@ def main() -> None:
             )
         )
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+        record_prediction_latency(elapsed)
         logging.info("Run complete: %d predictions in %.1f seconds", len(predictions), elapsed)
 
         for i, p in enumerate(predictions[:5], 1):
+            record_prediction(p.direction, interval=interval)
             logging.info(
-                "  #%d %s %s (%.1f%% conf, %+.2f%% mag, score=%.4f)",
+                "  #%d %s %s (%.1f%% conf, %+.2f%% mag, score=%.4f, unc=%.3f)",
                 i,
                 p.symbol,
                 p.direction,
                 max(p.prob_up, p.prob_flat, p.prob_down) * 100,
                 p.magnitude * 100,
                 p.signal_score,
+                p.uncertainty,
             )
 
 

@@ -111,6 +111,17 @@ timeframes:
     weight: 0.4                                 # ensemble weight
 
 # ---------------------------------------------------------------
+# Risk management
+# Controls entry filtering, drawdown circuit breakers, and regime
+# adjustments applied to the live prediction pipeline.
+# ---------------------------------------------------------------
+risk:
+  min_volume_24h: 100000.0    # minimum 24h USD volume to pass entry filter
+  max_spread_bps: 50.0        # maximum spread in basis points
+  drawdown_reduce_pct: 5.0    # reduce signal count at this drawdown %
+  drawdown_halt_pct: 10.0     # halt all signals at this drawdown %
+
+# ---------------------------------------------------------------
 # Backfill settings
 # ---------------------------------------------------------------
 backfill:

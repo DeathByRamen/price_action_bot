@@ -86,7 +86,7 @@ def compute_coinalyze_features(
 
     for col in get_coinalyze_feature_columns():
         if col in result.columns:
-            result[col] = result[col].ffill()
+            result[col] = result[col].fillna(0.0)
 
     return result
 
@@ -138,7 +138,7 @@ def compute_funding_rate_features(
 
     for col in get_funding_rate_feature_columns():
         if col in result.columns:
-            result[col] = result[col].ffill()
+            result[col] = result[col].fillna(0.0)
 
     return result
 
