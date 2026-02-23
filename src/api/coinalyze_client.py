@@ -25,9 +25,9 @@ logger = logging.getLogger(__name__)
 
 COINALYZE_BASE = "https://api.coinalyze.net/v1"
 
-# 40 calls/min = 0.667 calls/sec — use 0.55 for safety margin
-_RATE_LIMIT = 0.55
-_BURST = 2
+# 40 calls/min = 0.667 calls/sec — use 0.45 for conservative safety margin
+_RATE_LIMIT = 0.45
+_BURST = 1
 
 
 @dataclass
@@ -100,9 +100,11 @@ class CoinalyzeClient:
                 async with self._session.get(url, params=params) as resp:
                     if resp.status == 429:
                         retry_after = float(resp.headers.get("Retry-After", 10))
-                        retry_after = max(retry_after, 1.0)
+                        retry_after = max(retry_after, 60.0)
                         logger.warning(
-                            "Coinalyze rate-limited (429). Waiting %.1fs", retry_after
+                            "Coinalyze rate-limited (429). Waiting %.0fs "
+                            "(attempt %d/%d)",
+                            retry_after, attempt, self._max_retries,
                         )
                         await asyncio.sleep(retry_after)
                         continue
@@ -293,14 +295,16 @@ class CoinalyzeClient:
         interval: str = "15min",
         from_ts: int = 0,
         to_ts: int = 0,
-        batch_size: int = 20,
+        batch_size: int = 10,
     ) -> Dict[str, List]:
         """
         Fetch OI, liquidation, and L/S ratio history for all mapped symbols.
 
-        Batches requests at 20 symbols each (API limit).
-        Returns dict with keys "oi", "liquidations", "long_short",
-        each containing the raw API response lists.
+        Uses small batches (default 10) with explicit pacing between batches
+        to stay well under the 40-calls/min API rate limit.  Each batch
+        makes 3 requests (OI, liquidation, L/S), costing batch_size × 3
+        API calls.  A 45-second cooldown between batches ensures no minute
+        window ever exceeds the limit.
         """
         ca_symbols = list(symbol_map.values())
         batches = [
@@ -308,14 +312,22 @@ class CoinalyzeClient:
             for i in range(0, len(ca_symbols), batch_size)
         ]
 
+        total_batches = len(batches)
+        est_minutes = (total_batches * 50) / 60
+        logger.info(
+            "Coinalyze fetch: %d symbols in %d batches of %d "
+            "(~%.0f min estimated)",
+            len(ca_symbols), total_batches, batch_size, est_minutes,
+        )
+
         all_oi: List[Dict] = []
         all_liq: List[Dict] = []
         all_ls: List[Dict] = []
 
         for batch_idx, batch in enumerate(batches):
-            logger.debug(
+            logger.info(
                 "Coinalyze batch %d/%d (%d symbols)",
-                batch_idx + 1, len(batches), len(batch),
+                batch_idx + 1, total_batches, len(batch),
             )
 
             oi_data = await self.get_open_interest_history(
@@ -332,6 +344,10 @@ class CoinalyzeClient:
                 batch, interval, from_ts, to_ts
             )
             all_ls.extend(ls_data)
+
+            if batch_idx < total_batches - 1:
+                logger.debug("Cooling down 45s before next batch...")
+                await asyncio.sleep(45)
 
         logger.info(
             "Coinalyze fetch complete: %d OI, %d liquidation, %d L/S entries",
