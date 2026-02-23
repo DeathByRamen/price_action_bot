@@ -318,7 +318,7 @@ class DataCollector:
                         imbalance,
                     )
                 except Exception as exc:
-                    logger.debug("Order book fetch failed for %s: %s", symbol, exc)
+                    logger.warning("Order book fetch failed for %s: %s", symbol, exc)
                     return None
 
         results = await asyncio.gather(
@@ -393,7 +393,7 @@ class DataCollector:
                         funding_interval,
                     )
                 except Exception as exc:
-                    logger.debug("Funding rate fetch failed for %s: %s", symbol, exc)
+                    logger.warning("Funding rate fetch failed for %s: %s", symbol, exc)
                     return None
 
         results = await asyncio.gather(
