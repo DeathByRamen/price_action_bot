@@ -97,7 +97,10 @@ class CryptoTimeSeriesDataset(Dataset):
             direction[pct > flat_threshold] = LABEL_UP
             direction[pct < -flat_threshold] = LABEL_DOWN
 
-            features = df[self.feature_cols].values.astype(np.float32)
+            for col in self.feature_cols:
+                if col not in df.columns:
+                    df[col] = 0.0
+            features = df[self.feature_cols].fillna(0.0).values.astype(np.float32)
 
             self._sym_features.append(features)
             self._sym_directions.append(direction)

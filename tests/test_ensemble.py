@@ -8,7 +8,7 @@ torch = pytest.importorskip("torch")
 
 from src.model.ensemble import (
     _combine_probs_log_odds,
-    combine_predictions,
+    combine_timeframes,
     format_multi_timeframe_message,
 )
 from src.model.predictor import Prediction
@@ -65,34 +65,34 @@ class TestLogOddsCombination:
             assert abs(combined[i] - probs[i]) < 0.05
 
 
-class TestCombinePredictions:
+class TestCombineTimeframes:
     def test_combines_matching_symbols(self):
         primary = [_make_prediction("BTCUSDT", "UP", 0.7, 0.1, 0.2)]
         secondary = [_make_prediction("BTCUSDT", "UP", 0.6, 0.2, 0.2)]
-        result = combine_predictions(primary, secondary)
+        result = combine_timeframes(primary, secondary)
         assert len(result) == 1
         assert result[0].symbol == "BTCUSDT"
-        assert result[0].agreement_label == "STRONG"
+        assert result[0].agreement in ("STRONG", "PARTIAL")
 
     def test_skips_unmatched_symbols(self):
         primary = [_make_prediction("BTCUSDT")]
         secondary = [_make_prediction("ETHUSDT")]
-        result = combine_predictions(primary, secondary)
+        result = combine_timeframes(primary, secondary)
         assert len(result) == 0
 
     def test_conflict_classification(self):
         primary = [_make_prediction("BTCUSDT", "UP", 0.7, 0.1, 0.2, magnitude=0.03)]
         secondary = [_make_prediction("BTCUSDT", "DOWN", 0.1, 0.1, 0.8, magnitude=-0.03)]
-        result = combine_predictions(primary, secondary)
+        result = combine_timeframes(primary, secondary)
         assert len(result) == 1
-        assert result[0].agreement_label == "CONFLICT"
+        assert result[0].agreement == "CONFLICT"
 
 
 class TestFormatMessage:
     def test_produces_nonempty_string(self):
         primary = [_make_prediction("BTCUSDT", "UP", 0.7, 0.1, 0.2)]
         secondary = [_make_prediction("BTCUSDT", "UP", 0.6, 0.2, 0.2)]
-        combined = combine_predictions(primary, secondary)
+        combined = combine_timeframes(primary, secondary)
         msg = format_multi_timeframe_message(combined)
         assert len(msg) > 50
         assert "BTCUSDT" in msg

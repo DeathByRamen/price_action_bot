@@ -7,19 +7,20 @@ from src.features.indicators import (
     check_feature_correlation,
     compute_indicators,
     get_feature_columns,
+    get_technical_feature_columns,
 )
 
 
 class TestComputeIndicators:
-    def test_returns_all_feature_columns(self, synthetic_ohlcv):
+    def test_returns_all_technical_columns(self, synthetic_ohlcv):
         df = compute_indicators(synthetic_ohlcv.copy())
-        expected = get_feature_columns()
+        expected = get_technical_feature_columns()
         for col in expected:
             assert col in df.columns, f"Missing feature column: {col}"
 
     def test_no_nan_after_warmup(self, synthetic_ohlcv):
         df = compute_indicators(synthetic_ohlcv.copy())
-        feature_cols = get_feature_columns()
+        feature_cols = get_technical_feature_columns()
         after_warmup = df.iloc[MAX_WARMUP_PERIODS:]
         nan_counts = after_warmup[feature_cols].isna().sum()
         bad_cols = nan_counts[nan_counts > 0]
@@ -43,7 +44,7 @@ class TestComputeIndicators:
         df2[["open", "high", "low", "close"]] *= 1000
         df2 = compute_indicators(df2)
 
-        feature_cols = get_feature_columns()
+        feature_cols = get_technical_feature_columns()
         after = MAX_WARMUP_PERIODS + 10
 
         for col in feature_cols:
@@ -56,9 +57,13 @@ class TestComputeIndicators:
                 f"Feature '{col}' not scale-invariant: ratio={ratio:.4f}"
             )
 
-    def test_feature_count_matches(self):
+    def test_technical_feature_count(self):
+        cols = get_technical_feature_columns()
+        assert len(cols) == 41, f"Expected 41 technical features, got {len(cols)}"
+
+    def test_full_feature_count(self):
         cols = get_feature_columns()
-        assert len(cols) == 41, f"Expected 41 features, got {len(cols)}"
+        assert len(cols) == 60, f"Expected 60 total features, got {len(cols)}"
 
     def test_no_duplicates_in_feature_list(self):
         cols = get_feature_columns()
