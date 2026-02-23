@@ -4,10 +4,11 @@ and sample weights.
 
 Tables
 ------
-ohlcv             : (symbol, ts, open, high, low, close, volume)
-predictions       : predictions + outcome columns for scoring
-accuracy_log      : daily aggregate accuracy metrics
-sample_weights    : per-symbol training weights from the adaptive tuner
+ohlcv                  : (symbol, ts, open, high, low, close, volume)
+predictions            : predictions + outcome columns for scoring
+accuracy_log           : daily aggregate accuracy metrics
+sample_weights         : per-symbol training weights from the adaptive tuner
+order_book_snapshots   : periodic order book depth snapshots for future feature extraction
 """
 
 from __future__ import annotations
@@ -97,6 +98,23 @@ CREATE TABLE IF NOT EXISTS feature_importance (
     created_at    TEXT    DEFAULT (datetime('now')),
     UNIQUE(run_date, interval, feature_name)
 );
+
+CREATE TABLE IF NOT EXISTS order_book_snapshots (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol     TEXT    NOT NULL,
+    ts         TEXT    NOT NULL,
+    bid_prices TEXT    NOT NULL,
+    bid_vols   TEXT    NOT NULL,
+    ask_prices TEXT    NOT NULL,
+    ask_vols   TEXT    NOT NULL,
+    spread     REAL,
+    mid_price  REAL,
+    imbalance  REAL,
+    created_at TEXT    DEFAULT (datetime('now')),
+    UNIQUE(symbol, ts)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ob_sym_ts ON order_book_snapshots(symbol, ts);
 """
 
 MIGRATION_SQL = """
@@ -664,3 +682,79 @@ class Storage:
             (interval, interval, last_n_runs, last_n_runs, threshold),
         )
         return [(r[0], float(r[1])) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Order book snapshot operations
+    # ------------------------------------------------------------------
+    async def insert_order_book_snapshots(self, rows: List[Tuple]) -> int:
+        """
+        Bulk-insert order book snapshots.
+        Each row: (symbol, ts, bid_prices, bid_vols, ask_prices, ask_vols,
+                   spread, mid_price, imbalance)
+        Duplicates on (symbol, ts) are silently ignored.
+        Returns the number of rows inserted.
+        """
+        assert self._db is not None
+        sql = """
+            INSERT OR IGNORE INTO order_book_snapshots
+                (symbol, ts, bid_prices, bid_vols, ask_prices, ask_vols,
+                 spread, mid_price, imbalance)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        cursor = await self._db.executemany(sql, rows)
+        await self._db.commit()
+        return cursor.rowcount
+
+    async def get_order_book_snapshots(
+        self,
+        symbol: str,
+        start_ts: Optional[str] = None,
+        end_ts: Optional[str] = None,
+        limit: int = 1000,
+    ) -> pd.DataFrame:
+        """Return order book snapshots for a symbol within a time range."""
+        assert self._db is not None
+        conditions = ["symbol = ?"]
+        params: list = [symbol]
+
+        if start_ts:
+            conditions.append("ts >= ?")
+            params.append(start_ts)
+        if end_ts:
+            conditions.append("ts <= ?")
+            params.append(end_ts)
+
+        where = " AND ".join(conditions)
+        params.append(limit)
+        sql = f"""
+            SELECT symbol, ts, bid_prices, bid_vols, ask_prices, ask_vols,
+                   spread, mid_price, imbalance, created_at
+            FROM order_book_snapshots
+            WHERE {where}
+            ORDER BY ts DESC
+            LIMIT ?
+        """
+        rows = await self._db.execute_fetchall(sql, tuple(params))
+        return pd.DataFrame(
+            rows,
+            columns=[
+                "symbol", "ts", "bid_prices", "bid_vols", "ask_prices",
+                "ask_vols", "spread", "mid_price", "imbalance", "created_at",
+            ],
+        )
+
+    async def order_book_snapshot_count(
+        self, symbol: Optional[str] = None
+    ) -> int:
+        """Return number of order book snapshots, optionally filtered by symbol."""
+        assert self._db is not None
+        if symbol:
+            rows = await self._db.execute_fetchall(
+                "SELECT COUNT(*) FROM order_book_snapshots WHERE symbol = ?",
+                (symbol,),
+            )
+        else:
+            rows = await self._db.execute_fetchall(
+                "SELECT COUNT(*) FROM order_book_snapshots"
+            )
+        return rows[0][0]

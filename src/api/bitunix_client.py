@@ -290,3 +290,30 @@ class BitunixClient:
         url = f"{SPOT_BASE}/api/spot/v1/common/coin_pair/list"
         data = await self._request("GET", url)
         return data.get("data", []) or []
+
+    async def get_market_depth(
+        self, symbol: str, precision: int = 8
+    ) -> Optional[Dict[str, Any]]:
+        """
+        GET /api/spot/v1/market/depth
+
+        Returns the current order book depth for a symbol.
+
+        Parameters
+        ----------
+        symbol : str
+            Trading pair, e.g. "BTCUSDT"
+        precision : int
+            Token precision (decimal places for price grouping).
+
+        Returns
+        -------
+        dict with keys "asks", "bids", "ts" or None on failure.
+        Each ask/bid entry is {"price": str, "volume": str}.
+        """
+        url = f"{SPOT_BASE}/api/spot/v1/market/depth"
+        params = {"symbol": symbol.lower(), "precision": str(precision)}
+        data = await self._request("GET", url, params=params)
+        if data is None:
+            return None
+        return data.get("data")

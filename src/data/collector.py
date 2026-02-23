@@ -205,6 +205,114 @@ class DataCollector:
         return total
 
     # ------------------------------------------------------------------
+    # Order book snapshots
+    # ------------------------------------------------------------------
+    async def fetch_order_book_snapshots(
+        self,
+        symbols: List[str],
+        concurrency: int = 8,
+        max_levels: int = 15,
+    ) -> List[tuple]:
+        """
+        Fetch order book depth for all symbols and return rows ready for
+        ``storage.insert_order_book_snapshots()``.
+
+        Each row: (symbol, ts, bid_prices_json, bid_vols_json,
+                   ask_prices_json, ask_vols_json, spread, mid_price, imbalance)
+        """
+        import json
+        from datetime import datetime, timezone
+
+        semaphore = asyncio.Semaphore(concurrency)
+        ts_now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        rows: List[tuple] = []
+        errors = 0
+
+        async def _fetch_one(symbol: str) -> Optional[tuple]:
+            async with semaphore:
+                try:
+                    depth = await self.client.get_market_depth(symbol)
+                    if not depth:
+                        return None
+
+                    raw_bids = depth.get("bids") or depth.get("b") or []
+                    raw_asks = depth.get("asks") or depth.get("a") or []
+
+                    bids = raw_bids[:max_levels]
+                    asks = raw_asks[:max_levels]
+
+                    bid_prices = []
+                    bid_vols = []
+                    for entry in bids:
+                        if isinstance(entry, dict):
+                            bid_prices.append(float(entry.get("price", 0)))
+                            bid_vols.append(float(entry.get("volume", 0)))
+                        elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                            bid_prices.append(float(entry[0]))
+                            bid_vols.append(float(entry[1]))
+
+                    ask_prices = []
+                    ask_vols = []
+                    for entry in asks:
+                        if isinstance(entry, dict):
+                            ask_prices.append(float(entry.get("price", 0)))
+                            ask_vols.append(float(entry.get("volume", 0)))
+                        elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                            ask_prices.append(float(entry[0]))
+                            ask_vols.append(float(entry[1]))
+
+                    if not bid_prices or not ask_prices:
+                        return None
+
+                    best_bid = bid_prices[0]
+                    best_ask = ask_prices[0]
+                    spread = best_ask - best_bid
+                    mid_price = (best_ask + best_bid) / 2.0
+
+                    total_bid_vol = sum(bid_vols)
+                    total_ask_vol = sum(ask_vols)
+                    total_vol = total_bid_vol + total_ask_vol
+                    imbalance = total_bid_vol / total_vol if total_vol > 0 else 0.5
+
+                    snapshot_ts = depth.get("ts", ts_now)
+                    if isinstance(snapshot_ts, (int, float)):
+                        snapshot_ts = datetime.fromtimestamp(
+                            snapshot_ts / 1000, tz=timezone.utc
+                        ).strftime("%Y-%m-%dT%H:%M:%S")
+
+                    return (
+                        symbol,
+                        snapshot_ts,
+                        json.dumps(bid_prices),
+                        json.dumps(bid_vols),
+                        json.dumps(ask_prices),
+                        json.dumps(ask_vols),
+                        spread,
+                        mid_price,
+                        imbalance,
+                    )
+                except Exception as exc:
+                    logger.debug("Order book fetch failed for %s: %s", symbol, exc)
+                    return None
+
+        results = await asyncio.gather(
+            *[_fetch_one(s) for s in symbols], return_exceptions=True
+        )
+
+        for sym, res in zip(symbols, results):
+            if isinstance(res, Exception):
+                errors += 1
+                logger.debug("Order book error for %s: %s", sym, res)
+            elif res is not None:
+                rows.append(res)
+
+        logger.info(
+            "Order book snapshots: %d collected, %d failed out of %d symbols",
+            len(rows), errors, len(symbols),
+        )
+        return rows
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
     @staticmethod
