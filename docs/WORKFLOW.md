@@ -529,3 +529,40 @@ Predictions → Wait for outcomes → Score accuracy
 ```
 
 The system gets smarter every day — not by magic, but by systematically measuring where it fails, adjusting what "flat" means for the current market, focusing training on its weakest symbols, and only deploying models that are provably at least as good as the previous one.
+
+---
+
+## 11. Advanced Capabilities (Road to 10/10)
+
+The following modules extend the base system described above. They are implemented and ready to integrate as the system matures:
+
+### Backtesting Engine (`src/backtesting/`)
+Before deploying any strategy changes, the backtesting engine simulates them on historical data. It models transaction costs (maker/taker fees, slippage, funding), computes standard quant metrics (Sharpe, Sortino, Calmar, max drawdown, profit factor), and supports walk-forward evaluation where the model never sees future data. Run via `scripts/run_backtest.py`.
+
+### Risk Management (`src/risk/`)
+Controls position sizing (Kelly criterion, volatility targeting), enforces portfolio-level limits (max exposure, correlated position caps), and implements a drawdown circuit breaker that reduces or halts trading during equity declines.
+
+### Multi-Model Ensemble (`src/model/multi_ensemble.py`)
+Combines predictions from LSTM, Temporal Fusion Transformer (`src/model/tft.py`), and gradient boosting (`src/model/gbm.py`). Weights are proportional to each model's recent Sharpe ratio, and diversity is enforced (only models with low prediction correlation are included).
+
+### Regime Detection (`src/model/regime.py`)
+An HMM trained on BTC/ETH data classifies the market into 4 states: trending up, trending down, ranging, or high-volatility. Each regime adjusts position sizing, FLAT threshold, and model selection.
+
+### P&L-Based Optimization (`src/scoring/pnl_optimizer.py`)
+Replaces accuracy-based threshold tuning with Sharpe-based tuning. A prediction that is wrong but causes a small loss is weighted differently than one causing a large loss. Optimizes the FLAT threshold to maximize simulated Sharpe over a recent window.
+
+### Uncertainty Quantification (`src/model/uncertainty.py`)
+MC Dropout runs inference N times with dropout enabled to measure prediction variance. High variance = low confidence = smaller positions or no trade. Deep ensemble disagreement provides an alternative uncertainty estimate.
+
+### Drift Monitoring (`src/model/drift.py`)
+Tracks prediction distribution shifts (KL divergence) and calibration quality (Expected Calibration Error). Alerts when the model's behavior changes significantly, triggering recalibration or retraining.
+
+### A/B Testing (`src/model/ab_testing.py`)
+Runs a shadow model alongside production, comparing Sharpe ratios without affecting live signals. Supports automated promotion with gradual rollout (10% → 25% → 50% → 100%).
+
+### Production Infrastructure
+- **Health checks** (`scripts/healthcheck.py`): monitors predictions, retraining, OB snapshots, DB size, disk space
+- **Prometheus metrics** (`src/monitoring/metrics.py`): prediction latency, accuracy, API health
+- **Docker Compose** (`docker-compose.yml`): full stack with TimescaleDB + Prometheus + Grafana
+- **PostgreSQL backend** (`src/data/postgres_storage.py`): TimescaleDB with hypertables and automatic compression
+- **CI/CD** (`.github/workflows/`): lint + test on push, auto-deploy on merge to main

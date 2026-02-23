@@ -24,6 +24,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from src.data.storage import Storage
 from src.features.indicators import compute_indicators, get_feature_columns
+from src.features.orderbook import compute_orderbook_features
+from src.features.derivatives import (
+    compute_coinalyze_features,
+    compute_funding_rate_features,
+    compute_cross_asset_features,
+)
 from src.model.dataset import walk_forward_split
 from src.model.trainer import Trainer, DEFAULT_CHECKPOINT_DIR
 
@@ -65,13 +71,14 @@ async def load_training_data(
         symbols = await storage.get_all_symbols()
         logging.info("Found %d symbols in database", len(symbols))
 
+        btc_df = await storage.get_candles("BTCUSDT", limit=max_candles_per_sym, interval=interval)
+
         for sym in symbols:
             df = await storage.get_candles(sym, limit=max_candles_per_sym, interval=interval)
             if len(df) < min_candles:
                 logging.debug("Skipping %s: only %d candles (%sm)", sym, len(df), interval)
                 continue
 
-            # Rolling window filter
             if rolling_days is not None and "ts" in df.columns:
                 try:
                     cutoff = datetime.now(timezone.utc) - timedelta(days=rolling_days)
@@ -81,7 +88,44 @@ async def load_training_data(
                     pass
 
             df = compute_indicators(df)
-            df = df.dropna().reset_index(drop=True)
+
+            start_ts = str(df["ts"].iloc[0]) if "ts" in df.columns and len(df) > 0 else None
+
+            try:
+                ob_df = await storage.get_order_book_snapshots(sym, start_ts=start_ts, limit=max_candles_per_sym)
+                if not ob_df.empty:
+                    df = compute_orderbook_features(ob_df, df)
+            except Exception:
+                pass
+
+            try:
+                oi_df = await storage.get_coinalyze_oi(sym, start_ts=start_ts, limit=max_candles_per_sym)
+                liq_df = await storage.get_coinalyze_liquidations(sym, start_ts=start_ts, limit=max_candles_per_sym)
+                ls_df = await storage.get_coinalyze_long_short(sym, start_ts=start_ts, limit=max_candles_per_sym)
+                if not oi_df.empty or not liq_df.empty or not ls_df.empty:
+                    df = compute_coinalyze_features(oi_df, liq_df, ls_df, df)
+            except Exception:
+                pass
+
+            try:
+                fr_df = await storage.get_funding_rate_snapshots(sym, start_ts=start_ts, limit=max_candles_per_sym)
+                if not fr_df.empty:
+                    df = compute_funding_rate_features(fr_df, df)
+            except Exception:
+                pass
+
+            try:
+                if not btc_df.empty and sym != "BTCUSDT":
+                    df = compute_cross_asset_features(btc_df, df)
+            except Exception:
+                pass
+
+            for col in get_feature_columns():
+                if col not in df.columns:
+                    df[col] = 0.0
+            df = df.fillna(0.0)
+
+            df = df.dropna(subset=["close"]).reset_index(drop=True)
 
             if len(df) >= min_candles:
                 symbol_data[sym] = df

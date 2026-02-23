@@ -27,5 +27,26 @@ aiosqlite>=0.19
 pyyaml>=6.0
 python-dotenv>=1.0
 
-# Optional: charting / visualization
+# Visualization
 matplotlib>=3.7
+
+# --- Optional (install individually as needed) ---
+
+# Gradient boosting (Phase 5)
+# lightgbm>=4.0
+
+# Hyperparameter optimization (Phase 5)
+# optuna>=3.0
+
+# Regime detection (Phase 6)
+# hmmlearn>=0.3
+
+# PostgreSQL backend (Phase 7)
+# asyncpg>=0.29
+
+# Prometheus metrics (Phase 7)
+# prometheus-client>=0.19
+
+# Testing
+# pytest>=7.0
+# pytest-asyncio>=0.21

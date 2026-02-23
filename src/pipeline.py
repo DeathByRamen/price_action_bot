@@ -24,6 +24,12 @@ from src.api.bitunix_client import BitunixClient
 from src.data.collector import DataCollector
 from src.data.storage import Storage
 from src.features.indicators import MAX_WARMUP_PERIODS
+from src.features.orderbook import compute_orderbook_features
+from src.features.derivatives import (
+    compute_coinalyze_features,
+    compute_funding_rate_features,
+    compute_cross_asset_features,
+)
 from src.model.predictor import Prediction, Predictor
 from src.model.ensemble import (
     MultiTimeframePrediction,
@@ -138,9 +144,12 @@ async def run_pipeline(
         )
         logger.info("Fetched %d new %sm candles", new_candles, interval)
 
-        # 4. Load candles for all symbols, then batch-predict
+        # 4. Load candles for all symbols, then enrich with OB/derivatives
         symbol_latest_ts: dict[str, str] = {}
         symbol_dfs: dict[str, "pd.DataFrame"] = {}
+
+        btc_df = await storage.get_candles("BTCUSDT", limit=candle_limit, interval=interval)
+
         for symbol in symbols:
             try:
                 df = await storage.get_candles(
@@ -149,6 +158,42 @@ async def run_pipeline(
                 if df.empty or len(df) < window_size + MAX_WARMUP_PERIODS:
                     continue
                 symbol_latest_ts[symbol] = str(df["ts"].iloc[-1])
+
+                start_ts = str(df["ts"].iloc[0]) if "ts" in df.columns else None
+
+                try:
+                    ob_df = await storage.get_order_book_snapshots(
+                        symbol, start_ts=start_ts, limit=candle_limit * 2
+                    )
+                    if not ob_df.empty:
+                        df = compute_orderbook_features(ob_df, df)
+                except Exception:
+                    pass
+
+                try:
+                    oi_df = await storage.get_coinalyze_oi(symbol, start_ts=start_ts, limit=candle_limit)
+                    liq_df = await storage.get_coinalyze_liquidations(symbol, start_ts=start_ts, limit=candle_limit)
+                    ls_df = await storage.get_coinalyze_long_short(symbol, start_ts=start_ts, limit=candle_limit)
+                    if not oi_df.empty or not liq_df.empty or not ls_df.empty:
+                        df = compute_coinalyze_features(oi_df, liq_df, ls_df, df)
+                except Exception:
+                    pass
+
+                try:
+                    fr_df = await storage.get_funding_rate_snapshots(
+                        symbol, start_ts=start_ts, limit=candle_limit
+                    )
+                    if not fr_df.empty:
+                        df = compute_funding_rate_features(fr_df, df)
+                except Exception:
+                    pass
+
+                try:
+                    if not btc_df.empty and symbol != "BTCUSDT":
+                        df = compute_cross_asset_features(btc_df, df)
+                except Exception:
+                    pass
+
                 symbol_dfs[symbol] = df
             except Exception as exc:
                 logger.warning("Failed to load candles for %s: %s", symbol, exc)

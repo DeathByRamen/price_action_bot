@@ -179,7 +179,14 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def get_feature_columns() -> list[str]:
-    """Return the ordered list of indicator column names used as model features."""
+    """Return the ordered list of all feature column names used as model features."""
+    from src.features.orderbook import get_orderbook_feature_columns
+    from src.features.derivatives import (
+        get_coinalyze_feature_columns,
+        get_funding_rate_feature_columns,
+        get_cross_asset_feature_columns,
+    )
+
     return [
         # Trend (price-relative)
         "ema_9_dist", "ema_21_dist", "ema_50_dist",
@@ -200,6 +207,36 @@ def get_feature_columns() -> list[str]:
         "ema_9_21_cross", "ema_21_50_cross",
         "price_vs_bb_upper", "price_vs_bb_lower",
         # Anti-pump/dump & mean reversion
+        "price_position_48", "price_position_168",
+        "momentum_accel", "atr_expansion",
+        "vol_price_ratio",
+        # Order book structural features
+        *get_orderbook_feature_columns(),
+        # Coinalyze derivatives features
+        *get_coinalyze_feature_columns(),
+        # Funding rate features
+        *get_funding_rate_feature_columns(),
+        # Cross-asset features
+        *get_cross_asset_feature_columns(),
+    ]
+
+
+def get_technical_feature_columns() -> list[str]:
+    """Return only the 41 core technical indicator columns (without OB/derivatives)."""
+    return [
+        "ema_9_dist", "ema_21_dist", "ema_50_dist",
+        "macd_norm", "macd_signal_norm", "macd_hist_norm",
+        "adx", "adx_pos", "adx_neg",
+        "rsi_14", "stoch_rsi_k", "stoch_rsi_d",
+        "williams_r", "roc_12",
+        "bb_width", "bb_pct", "atr_pct",
+        "kc_width", "kc_dist",
+        "obv_roc", "acc_dist_roc", "vol_sma_ratio", "vol_z_score", "vwap_dist",
+        "pct_change_1", "pct_change_4", "pct_change_24",
+        "pct_change_72", "pct_change_168",
+        "candle_body_ratio", "upper_wick_ratio", "lower_wick_ratio",
+        "ema_9_21_cross", "ema_21_50_cross",
+        "price_vs_bb_upper", "price_vs_bb_lower",
         "price_position_48", "price_position_168",
         "momentum_accel", "atr_expansion",
         "vol_price_ratio",

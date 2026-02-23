@@ -37,9 +37,17 @@ from src.api.bitunix_client import BitunixClient
 from src.data.collector import DataCollector
 from src.data.storage import Storage
 from src.features.indicators import get_feature_columns
+from src.features.orderbook import compute_orderbook_features
+from src.features.derivatives import (
+    compute_coinalyze_features,
+    compute_funding_rate_features,
+    compute_cross_asset_features,
+)
 from src.model.dataset import walk_forward_split, DEFAULT_FLAT_THRESHOLD
 from src.model.trainer import Trainer
 from src.model.importance import compute_permutation_importance, format_importance_report
+from src.model.drift import DriftMonitor, DriftConfig
+from src.model.regime import RegimeDetector, REGIME_NAMES
 from src.pipeline import build_dispatcher
 from src.scoring.accuracy import score_predictions, compute_accuracy_report, AccuracyReport
 from src.scoring.adaptive import (
@@ -382,7 +390,7 @@ async def async_main(args: argparse.Namespace) -> None:
 
     all_intervals = [tf[0] for tf in timeframes_to_train]
     n_timeframes = len(timeframes_to_train)
-    total_steps = 4 + n_timeframes + 1
+    total_steps = 6 + n_timeframes + 1
 
     # Step 1: Gap-fill recent candles for all timeframes
     step = 1
@@ -403,11 +411,60 @@ async def async_main(args: argparse.Namespace) -> None:
             report.total_scored,
         )
 
-    # Step 3: Report threshold change
+    # Step 3: Regime detection
+    step += 1
+    logging.info("Step %d/%d: Detecting market regime...", step, total_steps)
+    regime_label = "Unknown"
+    try:
+        async with Storage(args.db) as storage:
+            btc_df = await storage.get_candles("BTCUSDT", limit=500, interval="60")
+            eth_df = await storage.get_candles("ETHUSDT", limit=500, interval="60")
+        if not btc_df.empty:
+            detector = RegimeDetector()
+            detector.fit(btc_df, eth_df if not eth_df.empty else None)
+            regime = detector.predict(btc_df)
+            regime_label = REGIME_NAMES.get(regime, "Ranging")
+            adjustments = detector.get_regime_adjustments(regime)
+            logging.info("Current regime: %s (adjustments: %s)", regime_label, adjustments)
+    except Exception as exc:
+        logging.warning("Regime detection failed: %s", exc)
+
+    # Step 4: Drift monitoring
+    step += 1
+    logging.info("Step %d/%d: Running drift check...", step, total_steps)
+    drift_report_text = ""
+    try:
+        drift_monitor = DriftMonitor(DriftConfig())
+        async with Storage(args.db) as storage:
+            rows = await storage._db.execute_fetchall(
+                "SELECT direction, prob_up, prob_flat, prob_down, actual_direction "
+                "FROM predictions WHERE actual_direction IS NOT NULL "
+                "ORDER BY candle_ts DESC LIMIT 500"
+            )
+        for row in rows:
+            direction, p_up, p_flat, p_down = row[0], row[1], row[2], row[3]
+            actual = row[4]
+            drift_monitor.record_prediction(direction, p_up, p_flat, p_down, actual)
+        drift = drift_monitor.check_drift()
+        if drift.distribution_shift or drift.calibration_degraded:
+            drift_report_text = (
+                f"\n**Drift Alert**\n"
+                f"  KL divergence: {drift.kl_divergence:.4f}"
+                f"{'  ⚠ SHIFT DETECTED' if drift.distribution_shift else ''}\n"
+                f"  Calibration error: {drift.calibration_error:.4f}"
+                f"{'  ⚠ DEGRADED' if drift.calibration_degraded else ''}"
+            )
+            logging.warning("Drift detected: KL=%.4f, ECE=%.4f", drift.kl_divergence, drift.calibration_error)
+        else:
+            logging.info("No significant drift detected (KL=%.4f, ECE=%.4f)", drift.kl_divergence, drift.calibration_error)
+    except Exception as exc:
+        logging.warning("Drift monitoring failed: %s", exc)
+
+    # Step 5: Report threshold change
     step += 1
     logging.info("Step %d/%d: Threshold %.4f -> %.4f", step, total_steps, old_threshold, new_threshold)
 
-    # Step 4: Back up existing checkpoints
+    # Step 6: Back up existing checkpoints
     step += 1
     logging.info("Step %d/%d: Backing up existing model checkpoints...", step, total_steps)
     backup_checkpoint()
@@ -449,7 +506,14 @@ async def async_main(args: argparse.Namespace) -> None:
     # Final step: Send digest
     step += 1
     logging.info("Step %d/%d: Sending accuracy digest...", step, total_steps)
-    extra_report = low_imp_warnings if low_imp_warnings else None
+    extra_sections = []
+    if regime_label != "Unknown":
+        extra_sections.append(f"\n**Market Regime:** {regime_label}")
+    if drift_report_text:
+        extra_sections.append(drift_report_text)
+    if low_imp_warnings:
+        extra_sections.append(low_imp_warnings)
+    extra_report = "\n".join(extra_sections) if extra_sections else None
     await send_accuracy_digest(config, report, new_threshold, old_threshold, extra_report)
 
     elapsed = (datetime.now(timezone.utc) - start).total_seconds()

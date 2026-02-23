@@ -75,7 +75,7 @@ class Predictor:
 
         path = model_path or DEFAULT_MODEL_PATH
         if os.path.exists(path):
-            data = torch.load(path, map_location=self.device, weights_only=False)
+            data = torch.load(path, map_location=self.device, weights_only=True)
             if isinstance(data, dict) and "model_state_dict" in data:
                 ckpt_feats = data.get("num_features")
                 ckpt_hidden = data.get("hidden_dim")
@@ -125,16 +125,19 @@ class Predictor:
             )
             return None
 
-        # Compute indicators
         df = compute_indicators(df.copy())
-        df = df.dropna().reset_index(drop=True)
+
+        for col in self.feature_cols:
+            if col not in df.columns:
+                df[col] = 0.0
+
+        df = df.dropna(subset=["close"]).reset_index(drop=True)
 
         if len(df) < self.window_size:
             logger.debug("%s: insufficient data after indicator NaN drop", symbol)
             return None
 
-        # Extract and normalize the feature window
-        feature_data = df[self.feature_cols].values.astype(np.float32)
+        feature_data = df[self.feature_cols].fillna(0.0).values.astype(np.float32)
         window = feature_data[-self.window_size:]
 
         # Per-window Z-score normalization (matches training exactly)
@@ -229,11 +232,16 @@ class Predictor:
             if len(df) < min_rows:
                 continue
             df_ind = compute_indicators(df.copy())
-            df_ind = df_ind.dropna().reset_index(drop=True)
+
+            for col in self.feature_cols:
+                if col not in df_ind.columns:
+                    df_ind[col] = 0.0
+
+            df_ind = df_ind.dropna(subset=["close"]).reset_index(drop=True)
             if len(df_ind) < self.window_size:
                 continue
 
-            feature_data = df_ind[self.feature_cols].values.astype(np.float32)
+            feature_data = df_ind[self.feature_cols].fillna(0.0).values.astype(np.float32)
             window = feature_data[-self.window_size:]
 
             # Per-window Z-score normalization

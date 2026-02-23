@@ -558,6 +558,71 @@ sqlite3 data/ohlcv.db "SELECT MAX(ts) FROM ohlcv;"  # latest candle?
 
 ---
 
+## 17. Health Check Monitoring
+
+The health check script monitors critical system components and can send email alerts:
+
+```bash
+# Manual health check
+cd /opt/pa_bot && source venv/bin/activate
+python3 scripts/healthcheck.py
+
+# Add to cron for automated alerting (every 30 minutes):
+*/30 * * * * cd /opt/pa_bot && /opt/pa_bot/venv/bin/python scripts/healthcheck.py --notify >> logs/health.log 2>&1
+```
+
+What it checks:
+- Last prediction < 2 hours ago
+- Last retrain < 26 hours ago
+- Last order book snapshot < 20 minutes ago
+- Database size < 5 GB
+- Disk free space > 2 GB
+
+---
+
+## 18. Docker Deployment (Alternative)
+
+For a containerized deployment with TimescaleDB and monitoring:
+
+```bash
+cd /opt/pa_bot
+
+# Set up environment
+cp .env.example .env
+nano .env  # fill in credentials + POSTGRES_PASSWORD
+
+# Start the full stack
+docker-compose up -d
+
+# Check container status
+docker-compose ps
+
+# View app logs
+docker-compose logs -f app
+```
+
+This starts: PA Bot app + TimescaleDB (PostgreSQL) + Prometheus + Grafana.
+
+Grafana is available at `http://YOUR_SERVER_IP:3000` (default password: admin).
+
+---
+
+## 19. Running a Backtest
+
+Validate the model's performance on historical data:
+
+```bash
+cd /opt/pa_bot && source venv/bin/activate
+
+# Single-pass backtest (last 90 days)
+python3 scripts/run_backtest.py --interval 60 --days 90 --capital 10000
+
+# Walk-forward backtest (realistic out-of-sample evaluation)
+python3 scripts/run_backtest.py --walk-forward --folds 5
+```
+
+---
+
 ## Quick Reference
 
 | Task | Command |
@@ -566,12 +631,16 @@ sqlite3 data/ohlcv.db "SELECT MAX(ts) FROM ohlcv;"  # latest candle?
 | Activate venv | `cd /opt/pa_bot && source venv/bin/activate` |
 | Check prediction logs | `tail -50 logs/prediction.log` |
 | Check retrain logs | `tail -50 logs/retrain.log` |
+| Check health | `python3 scripts/healthcheck.py` |
 | Manual prediction run | `python3 scripts/run_prediction.py --multi-timeframe` |
 | Manual retrain | `python3 scripts/daily_retrain.py` |
+| Run backtest | `python3 scripts/run_backtest.py --walk-forward` |
 | Pull latest code | `git pull` |
 | View cron schedule | `crontab -l` |
 | Edit cron schedule | `crontab -e` |
 | Database shell | `sqlite3 data/ohlcv.db` |
+| Docker start | `docker-compose up -d` |
+| Docker logs | `docker-compose logs -f app` |
 | Check disk space | `df -h` |
 | Check memory usage | `free -h` |
 | Check running processes | `htop` |

@@ -1,5 +1,12 @@
 # PA Bot — Phase 2 Roadmap: Order Book Integration & Beyond
 
+> **Status (Feb 2026):** Most items in this roadmap have been **implemented** as part
+> of the comprehensive "Road to 10/10" plan. See the **Status** annotations on each
+> phase below. The full implementation lives in `src/features/orderbook.py`,
+> `src/features/derivatives.py`, `src/data/quality.py`, `src/backtesting/`,
+> `src/risk/`, `src/model/tft.py`, `src/model/gbm.py`, `src/model/regime.py`,
+> `src/model/drift.py`, and more.
+
 This document captures everything that needs to be implemented after the base system is running in production. It's designed to survive context loss — every detail needed to continue development is here.
 
 ---
@@ -76,6 +83,9 @@ Order book snapshots need to accumulate for **2-4 weeks** before Phase 2A can be
 
 ## 2. Phase 2A — Order Book Feature Extraction
 
+> **Status: IMPLEMENTED** — `src/features/orderbook.py` provides `compute_orderbook_features()`
+> with imbalance, spread (bps), depth ratio, total depth, and change-rate features.
+
 ### What to Build
 
 Create a new module `src/features/orderbook_features.py` that takes raw order book snapshots and computes features aligned to OHLCV candle timestamps.
@@ -135,6 +145,10 @@ async def compute_orderbook_features(
 ---
 
 ## 3. Phase 2B — Model Integration
+
+> **Status: IMPLEMENTED** — Multi-model ensemble (`src/model/multi_ensemble.py`) supports
+> LSTM + TFT + GBM combination. TFT (`src/model/tft.py`) and GBM (`src/model/gbm.py`)
+> are ready for training alongside the existing LSTM.
 
 ### The Problem
 
@@ -235,6 +249,11 @@ This is especially important after adding OB features, as some may correlate wit
 ---
 
 ## 6. Phase 2E — Data Quality Monitoring
+
+> **Status: IMPLEMENTED** — `src/data/quality.py` provides `validate_candles()`,
+> `detect_gaps()`, `has_timestamp_gap_in_window()`, and `check_training_data_quality()`.
+> Candle validation is applied in `collector.py` during fetch and backfill.
+> Full test coverage in `tests/test_quality.py`.
 
 ### The Problem
 
@@ -447,17 +466,35 @@ These could be sourced from third-party providers (CoinGlass API, Coinalyze) in 
 
 ## 10. Priority & Timeline
 
-| Phase | What | When | Effort | Impact |
-|---|---|---|---|---|
-| **2A** | Order book feature extraction | After 2-4 weeks of OB data collection | 1-2 days | High |
-| **2B** | Model integration (retrain with 49 features) | Immediately after 2A | 0.5 days | High |
-| **2C** | Interval-specific threshold persistence | After 1 week of scored predictions | 0.5 days | Medium |
-| **2D** | Correlation guard integration | Any time | 1 hour | Low-Medium |
-| **2E** | Data quality monitoring | Any time | 0.5 days | Medium |
-| **2F** | WebSocket upgrade | Only if REST is insufficient | 2-3 days | Uncertain |
-| **2G** | Futures-specific features — **Collection DONE**, feature extraction TODO | After 2-4 weeks of funding rate data | 0.5 days | High |
+| Phase | What | Status | Notes |
+|---|---|---|---|
+| **2A** | Order book feature extraction | **DONE** | `src/features/orderbook.py` |
+| **2B** | Model integration (multi-model ensemble) | **DONE** | LSTM + TFT + GBM in `src/model/` |
+| **2C** | Interval-specific threshold persistence | Pending | Needs per-interval scoring data |
+| **2D** | Correlation guard integration | Pending | Quick win |
+| **2E** | Data quality monitoring | **DONE** | `src/data/quality.py` + tests |
+| **2F** | WebSocket upgrade | Deferred | Only if REST proves insufficient |
+| **2G** | Futures features — collection + extraction | **DONE** | `src/features/derivatives.py` |
 
-**Recommended order:** 2D (quick win) → 2C → 2E → 2A + 2G-features → 2B → 2F
+### Additional Modules Built (Road to 10/10 Plan)
+
+| Module | What | Location |
+|---|---|---|
+| Backtesting engine | Event-driven backtester with costs, metrics, walk-forward | `src/backtesting/` |
+| Risk management | Kelly sizing, drawdown circuit breaker, portfolio limits | `src/risk/` |
+| Regime detection | HMM-based market state classification | `src/model/regime.py` |
+| P&L optimization | Sharpe-based threshold tuning (replaces accuracy-based) | `src/scoring/pnl_optimizer.py` |
+| Uncertainty quantification | MC Dropout + deep ensemble disagreement | `src/model/uncertainty.py` |
+| Meta-learning | Per-symbol/regime model selection, symbol clustering | `src/model/meta_learning.py` |
+| Drift monitoring | KL divergence, calibration ECE tracking | `src/model/drift.py` |
+| A/B testing | Shadow model comparison + gradual rollout | `src/model/ab_testing.py` |
+| HPO | Optuna integration for LSTM, TFT, GBM | `src/model/hpo.py` |
+| PostgreSQL backend | TimescaleDB with hypertables + compression | `src/data/postgres_storage.py` |
+| Prometheus metrics | Prediction latency, accuracy, API health | `src/monitoring/metrics.py` |
+| CI/CD | GitHub Actions lint + test + auto-deploy | `.github/workflows/` |
+| Docker | Multi-stage Dockerfile + Compose (app + DB + monitoring) | `Dockerfile`, `docker-compose.yml` |
+| Health checks | Production monitoring with email alerts | `scripts/healthcheck.py` |
+| Test suite | 36+ tests covering quality, indicators, scoring, ensemble | `tests/` |
 
 ---
 

@@ -1,0 +1,66 @@
+version: "3.9"
+
+services:
+  app:
+    build: .
+    container_name: pa-bot
+    env_file: .env
+    depends_on:
+      - timescaledb
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - pa-net
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: pa-timescaledb
+    environment:
+      POSTGRES_DB: pabot
+      POSTGRES_USER: pabot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pabot_secure_pw}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/home/postgres/pgdata/data
+    restart: unless-stopped
+    networks:
+      - pa-net
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: pa-prometheus
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - promdata:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    networks:
+      - pa-net
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: pa-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafanadata:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - pa-net
+
+volumes:
+  pgdata:
+  promdata:
+  grafanadata:
+
+networks:
+  pa-net:
+    driver: bridge

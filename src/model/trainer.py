@@ -375,7 +375,7 @@ class Trainer:
 
     def load(self, path: str) -> None:
         """Load model weights from checkpoint, verifying metadata if present."""
-        data = torch.load(path, map_location=self.device, weights_only=False)
+        data = torch.load(path, map_location=self.device, weights_only=True)
 
         if isinstance(data, dict) and "model_state_dict" in data:
             ckpt_feats = data.get("num_features")

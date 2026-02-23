@@ -15,19 +15,10 @@ bitunix:
 # API key loaded from .env as COINALYZE_API_KEY
 # ---------------------------------------------------------------
 coinalyze:
-  api_key: ""                  # loaded from .env
+  api_key: ""                  # loaded from .env (COINALYZE_API_KEY)
   exchange: "A"                # Binance perpetuals (largest, most liquid)
   collection_interval: "15min" # data granularity for ongoing collection
   enabled: true
-
-# ---------------------------------------------------------------
-# Coinalyze API (free — for OI, liquidation, long/short data)
-# Get a key at: https://coinalyze.net/account/api-key/
-# ---------------------------------------------------------------
-coinalyze:
-  api_key: ""                  # or set COINALYZE_API_KEY in .env
-  exchange: "A"                # Binance perpetuals (largest, most liquid)
-  collection_interval: "15min" # data granularity (collected hourly)
 
 # ---------------------------------------------------------------
 # Model parameters
@@ -67,7 +58,7 @@ notifications:
     smtp_port: 587
     use_tls: true
     username: "seanmcgill714@gmail.com"
-    password: ""
+    # password loaded from .env (SMTP_PASSWORD) — never store in this file
     from_addr: "seanmcgill714@gmail.com"
     to_addrs:
       - "mcgillfinance@gmail.com"
