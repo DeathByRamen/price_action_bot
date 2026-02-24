@@ -825,10 +825,27 @@ async def async_main(args: argparse.Namespace) -> None:
         extra_sections.append(low_imp_warnings)
     if ab_report_text:
         extra_sections.append(ab_report_text)
+    elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+
+    # Build training summary for email
+    train_lines = [f"\n**Training Summary** (completed in {elapsed / 60:.1f} min)"]
+    for interval, path, history in trained_models:
+        if history:
+            best_epoch = int(np.argmin(history["val_loss"])) + 1
+            total_epochs = len(history["val_loss"])
+            val_loss = history["val_loss"][-1]
+            val_acc = history["val_cls_acc"][-1] * 100
+            val_mae = history["val_reg_mae"][-1]
+            train_lines.append(
+                f"  {interval}m: {total_epochs} epochs (best #{best_epoch}) | "
+                f"val_loss={val_loss:.4f} | val_acc={val_acc:.1f}% | val_mae={val_mae:.4f}"
+            )
+    if train_lines:
+        extra_sections.append("\n".join(train_lines))
+
     extra_report = "\n".join(extra_sections) if extra_sections else None
     await send_accuracy_digest(config, report, new_threshold, old_threshold, extra_report)
 
-    elapsed = (datetime.now(timezone.utc) - start).total_seconds()
     logging.info("=" * 60)
     logging.info("Retrain complete in %.1f seconds", elapsed)
     for interval, path, history in trained_models:
