@@ -191,7 +191,7 @@ def combine_timeframes(
         score = (
             norm_conviction
             * directional_prob
-            * abs(magnitude)
+            * abs(magnitude) * 100
             * agreement_multiplier[agreement]
         )
 

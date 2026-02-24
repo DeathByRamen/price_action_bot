@@ -507,6 +507,6 @@ def _compute_signal_score(
     conviction = max(0.0, 1.0 - (entropy / max_entropy))
 
     directional_prob = max(float(probs[0]), float(probs[2]))  # max of UP, DOWN
-    signal_score = conviction * directional_prob * abs(magnitude)
+    signal_score = conviction * directional_prob * abs(magnitude) * 100
 
     return conviction, signal_score
