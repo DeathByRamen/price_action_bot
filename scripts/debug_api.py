@@ -10,8 +10,6 @@ import aiohttp
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-
-
 SPOT_BASE = "https://openapi.bitunix.com"
 FUTURES_BASE = "https://fapi.bitunix.com"
 
