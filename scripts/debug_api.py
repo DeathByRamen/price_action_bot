@@ -6,9 +6,10 @@ import json
 import os
 import sys
 
+import aiohttp
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-import aiohttp
 
 
 SPOT_BASE = "https://openapi.bitunix.com"
