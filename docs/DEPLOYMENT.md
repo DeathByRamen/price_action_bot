@@ -320,6 +320,7 @@ SQLEOF
 | Out of memory | Add `--rolling-days 30 --batch-size 32` to train command |
 | Binance 451 error | Geo-blocked on your server's IP — not critical, those features stay 0.0 |
 | No email received | Check `SMTP_PASSWORD` in `.env` / check `logs/prediction.log` for errors |
+| Retrain log ends with `Killed` / no digest email | OOM: use `--lstm-only` in cron so only LSTM trains (skips TFT/GBM) |
 | SSH permission denied | Reset root password from Hetzner Console → Rescue tab |
 | Server rebooted | Cron survives reboots. Verify: `crontab -l` and `tail -5 logs/prediction.log` |
 

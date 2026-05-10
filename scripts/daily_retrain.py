@@ -174,6 +174,26 @@ async def run_scoring_and_tuning(
     return report, new_threshold, weights
 
 
+async def _send_failure_notification(config_path: str, error_message: str) -> None:
+    """Send a short email when daily retrain fails (e.g. OOM kill won't trigger this)."""
+    try:
+        config = load_config(config_path)
+        dispatcher = build_dispatcher(config)
+        if not dispatcher._channels:
+            return
+        from datetime import datetime, timezone
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        subject = f"[PA Bot] Daily retrain FAILED — {now_utc}"
+        body = f"Daily retrain failed before sending the success digest.\n\nError: {error_message}\n\nCheck logs/retrain.log on the server."
+        for channel in dispatcher._channels:
+            try:
+                await channel.send(body, subject=subject)
+            except Exception as e:
+                logging.error("Failed to send failure notification: %s", e)
+    except Exception as e:
+        logging.error("Could not send failure notification: %s", e)
+
+
 async def send_accuracy_digest(
     config: dict,
     report: AccuracyReport | None,
@@ -249,9 +269,10 @@ async def _train_single_timeframe(
     new_threshold: float,
     symbol_weights: dict[str, float],
     feature_cols: list[str],
+    lstm_only: bool = False,
 ) -> tuple[str, dict, dict[str, float]]:
     """Train a single timeframe model and return (save_path, history, importances)."""
-    logging.info("--- Training %sm model (window=%d) ---", interval, window_size)
+    logging.info("--- Training %sm model (window=%d)%s ---", interval, window_size, " [LSTM only]" if lstm_only else "")
 
     symbol_data = await load_training_data(
         db_path, rolling_days=rolling_days, interval=interval
@@ -458,66 +479,68 @@ async def _train_single_timeframe(
 
     # --- Train TFT model ---
     tft_sharpe = 0.0
-    try:
-        from torch.optim import AdamW
-        from torch.optim.lr_scheduler import ReduceLROnPlateau
+    if not lstm_only:
+        try:
+            from torch.optim import AdamW
+            from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-        from src.model.tft import TemporalFusionTransformer
-        logging.info("[%sm] Training TFT model...", interval)
-        tft_trainer = Trainer(
-            num_features=len(feature_cols),
-            hidden_dim=64,
-            num_layers=1,
-            dropout=0.3,
-            lr=1e-3,
-            batch_size=64,
-            max_epochs=epochs,
-            patience=patience,
-            class_weights=class_weights,
-        )
-        tft_model = TemporalFusionTransformer(
-            num_features=len(feature_cols), d_model=64, num_heads=4,
-            num_lstm_layers=1, dropout=0.3,
-        ).to(tft_trainer.device)
-        tft_trainer.model = tft_model
-        tft_trainer.optimizer = AdamW(tft_model.parameters(), lr=1e-3, weight_decay=1e-4)
-        tft_trainer.scheduler = ReduceLROnPlateau(tft_trainer.optimizer, mode="min", factor=0.5, patience=5)
-        tft_history = tft_trainer.fit(
-            train_ds, val_ds, tag=f"retrain_tft_{interval}", use_sample_weights=use_weights
-        )
-        tft_trainer.calibrate_temperature(val_ds)
-        tft_trainer.save_final(tag=f"final_{interval}_tft", feature_cols=feature_cols)
-        tft_metrics = tft_trainer.evaluate(val_ds)
-        tft_sharpe = tft_metrics.get("sharpe", 0.0)
-        logging.info("[%sm] TFT training complete: val_loss=%.4f", interval,
-                     tft_history.get("val_loss", [0])[-1] if tft_history.get("val_loss") else 0)
-    except Exception as exc:
-        logging.warning("[%sm] TFT training failed: %s", interval, exc)
+            from src.model.tft import TemporalFusionTransformer
+            logging.info("[%sm] Training TFT model...", interval)
+            tft_trainer = Trainer(
+                num_features=len(feature_cols),
+                hidden_dim=64,
+                num_layers=1,
+                dropout=0.3,
+                lr=1e-3,
+                batch_size=64,
+                max_epochs=epochs,
+                patience=patience,
+                class_weights=class_weights,
+            )
+            tft_model = TemporalFusionTransformer(
+                num_features=len(feature_cols), d_model=64, num_heads=4,
+                num_lstm_layers=1, dropout=0.3,
+            ).to(tft_trainer.device)
+            tft_trainer.model = tft_model
+            tft_trainer.optimizer = AdamW(tft_model.parameters(), lr=1e-3, weight_decay=1e-4)
+            tft_trainer.scheduler = ReduceLROnPlateau(tft_trainer.optimizer, mode="min", factor=0.5, patience=5)
+            tft_history = tft_trainer.fit(
+                train_ds, val_ds, tag=f"retrain_tft_{interval}", use_sample_weights=use_weights
+            )
+            tft_trainer.calibrate_temperature(val_ds)
+            tft_trainer.save_final(tag=f"final_{interval}_tft", feature_cols=feature_cols)
+            tft_metrics = tft_trainer.evaluate(val_ds)
+            tft_sharpe = tft_metrics.get("sharpe", 0.0)
+            logging.info("[%sm] TFT training complete: val_loss=%.4f", interval,
+                         tft_history.get("val_loss", [0])[-1] if tft_history.get("val_loss") else 0)
+        except Exception as exc:
+            logging.warning("[%sm] TFT training failed: %s", interval, exc)
 
     # --- Train GBM model ---
     gbm_sharpe = 0.0
-    try:
-        from torch.utils.data import DataLoader
+    if not lstm_only:
+        try:
+            from torch.utils.data import DataLoader
 
-        from src.model.gbm import GBMPredictor
-        logging.info("[%sm] Training GBM model...", interval)
+            from src.model.gbm import GBMPredictor
+            logging.info("[%sm] Training GBM model...", interval)
 
-        def _extract_dataset_arrays(ds):
-            loader = DataLoader(ds, batch_size=len(ds), shuffle=False)
-            x_all, y_cls_all, y_reg_all = next(iter(loader))
-            return x_all.numpy(), y_cls_all.numpy(), y_reg_all.numpy()
+            def _extract_dataset_arrays(ds):
+                loader = DataLoader(ds, batch_size=len(ds), shuffle=False)
+                x_all, y_cls_all, y_reg_all = next(iter(loader))
+                return x_all.numpy(), y_cls_all.numpy(), y_reg_all.numpy()
 
-        X_train, y_cls_train, y_reg_train = _extract_dataset_arrays(train_ds)
-        X_val, y_cls_val, y_reg_val = _extract_dataset_arrays(val_ds)
+            X_train, y_cls_train, y_reg_train = _extract_dataset_arrays(train_ds)
+            X_val, y_cls_val, y_reg_val = _extract_dataset_arrays(val_ds)
 
-        gbm = GBMPredictor()
-        gbm.fit(X_train, y_cls_train, y_reg_train, X_val, y_cls_val, y_reg_val)
-        gbm_path = os.path.join("data", "models", f"model_final_{interval}_gbm.pkl")
-        os.makedirs(os.path.dirname(gbm_path), exist_ok=True)
-        gbm.save(gbm_path)
-        logging.info("[%sm] GBM model saved to %s", interval, gbm_path)
-    except Exception as exc:
-        logging.warning("[%sm] GBM training failed: %s", interval, exc)
+            gbm = GBMPredictor()
+            gbm.fit(X_train, y_cls_train, y_reg_train, X_val, y_cls_val, y_reg_val)
+            gbm_path = os.path.join("data", "models", f"model_final_{interval}_gbm.pkl")
+            os.makedirs(os.path.dirname(gbm_path), exist_ok=True)
+            gbm.save(gbm_path)
+            logging.info("[%sm] GBM model saved to %s", interval, gbm_path)
+        except Exception as exc:
+            logging.warning("[%sm] GBM training failed: %s", interval, exc)
 
     # Persist model sharpes for ensemble weighting
     lstm_sharpe = new_metrics.get("sharpe", 0.0)
@@ -740,6 +763,7 @@ async def async_main(args: argparse.Namespace) -> None:
             new_threshold=scaled_threshold,
             symbol_weights=symbol_weights,
             feature_cols=feature_cols,
+            lstm_only=args.lstm_only,
         )
         if final_path:
             trained_models.append((interval, final_path, history))
@@ -869,6 +893,11 @@ def main() -> None:
         help="Path to settings.yaml",
     )
     parser.add_argument("--db", type=str, default=None, help="Override SQLite DB path")
+    parser.add_argument(
+        "--lstm-only",
+        action="store_true",
+        help="Skip TFT and GBM training (use when low on RAM to avoid OOM)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -876,7 +905,12 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    asyncio.run(async_main(args))
+    try:
+        asyncio.run(async_main(args))
+    except Exception as exc:
+        logging.exception("Daily retrain failed")
+        asyncio.run(_send_failure_notification(args.config, str(exc)))
+        raise
 
 
 if __name__ == "__main__":
